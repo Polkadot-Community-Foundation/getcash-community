@@ -53,7 +53,6 @@ function fromPipeline(step: FundingStep | null, steps: JourneySteps): number {
     case "done":
       return steps - 1;
     case "swap":
-    case "xcm":
     case "await-arrival":
       // The conversion is underway: everything before it is done on either scale.
       return steps === 3 ? 1 : 3;
