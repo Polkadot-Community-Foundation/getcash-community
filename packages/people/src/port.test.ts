@@ -57,7 +57,7 @@ describe("CASH constants", () => {
       type: string;
       value: unknown;
     }>;
-    expect(para).toEqual(expect.objectContaining({ type: "Parachain", value: 1500 }));
+    expect(para).toEqual(expect.objectContaining({ type: "Parachain", value: 1000 }));
     expect(pallet).toEqual(expect.objectContaining({ type: "PalletInstance", value: 50 }));
     expect(index).toEqual(expect.objectContaining({ type: "GeneralIndex", value: 50_000_413n }));
     expect(CASH_DECIMALS).toBe(6);

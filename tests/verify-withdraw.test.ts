@@ -25,8 +25,8 @@ const BURNER_LABEL = process.env.WITHDRAW_BURNER;
 
 describe.runIf(process.env.VERIFY_WITHDRAW === "1")("live withdrawal sizing", () => {
   it("sizes the swap, and the XCM when the key holds PAS, and proves the XCM on both chains", async () => {
-    const ahC = createClient(getWsProvider("wss://paseo-asset-hub-next-rpc.polkadot.io"));
-    const peC = createClient(getWsProvider("wss://paseo-people-next-system-rpc.polkadot.io"));
+    const ahC = createClient(getWsProvider("wss://asset-hub-paseo-rpc.n.dwellir.com"));
+    const peC = createClient(getWsProvider("wss://people-paseo.rotko.net"));
     const assetHubApi = ahC.getTypedApi(paseo_next_v2);
     const peopleApi = peC.getTypedApi(paseo_people_next);
     try {

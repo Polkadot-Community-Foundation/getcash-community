@@ -33,8 +33,8 @@ const POLL_MS = 4_000;
 
 describe.runIf(process.env.PROD_PROOF_WITHDRAW === "1")("withdrawal production proof", () => {
   it("moves a burner's CASH on People to Alice on Asset Hub as PAS", async () => {
-    const ahC = createClient(getWsProvider("wss://paseo-asset-hub-next-rpc.polkadot.io"));
-    const peC = createClient(getWsProvider("wss://paseo-people-next-system-rpc.polkadot.io"));
+    const ahC = createClient(getWsProvider("wss://asset-hub-paseo-rpc.n.dwellir.com"));
+    const peC = createClient(getWsProvider("wss://people-paseo.rotko.net"));
     const assetHubApi = ahC.getTypedApi(paseo_next_v2);
     const peopleApi = peC.getTypedApi(paseo_people_next);
     try {

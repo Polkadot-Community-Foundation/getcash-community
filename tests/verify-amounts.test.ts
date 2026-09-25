@@ -28,8 +28,8 @@ const fmtPas = (v: bigint) => (Number(v) / 1e10).toFixed(6);
 
 describe.runIf(process.env.VERIFY_AMOUNTS === "1")("live amount check", () => {
   it("ask for 20 / 50 / 100 CASH -> what lands", async () => {
-    const ahC = createClient(getWsProvider("wss://paseo-asset-hub-next-rpc.polkadot.io"));
-    const peC = createClient(getWsProvider("wss://paseo-people-next-system-rpc.polkadot.io"));
+    const ahC = createClient(getWsProvider("wss://asset-hub-paseo-rpc.n.dwellir.com"));
+    const peC = createClient(getWsProvider("wss://people-paseo.rotko.net"));
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ah: any = ahC.getTypedApi(paseo_next_v2);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -152,7 +152,7 @@ async function step<T>(label: string, ms: number, work: Promise<T>): Promise<T> 
 const ahBlockLink = (block?: number) =>
   block === undefined
     ? ""
-    : ` https://polkadot.js.org/apps/?rpc=wss%3A%2F%2Fpaseo-asset-hub-next-rpc.polkadot.io#/explorer/query/${block}`;
+    : ` https://polkadot.js.org/apps/?rpc=wss%3A%2F%2Fasset-hub-paseo-rpc.n.dwellir.com#/explorer/query/${block}`;
 
 export interface QuotedView {
   send: string;

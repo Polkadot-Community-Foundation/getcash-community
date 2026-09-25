@@ -7,8 +7,13 @@ import { withTimeout } from "./timeout";
 // The genesis hashes come from the file papi regenerates with the descriptors.
 import papiConfig from "../.papi/polkadot-api.json";
 
-export const ASSET_HUB_WS = "wss://paseo-asset-hub-next-rpc.polkadot.io";
-export const PEOPLE_WS = "wss://paseo-people-next-system-rpc.polkadot.io";
+// PCF devnet RPCs (RC chains_v2 devnet catalog); papi rotates to the next on failure.
+export const ASSET_HUB_WS = ["wss://asset-hub-paseo-rpc.n.dwellir.com"];
+export const PEOPLE_WS = [
+  "wss://people-paseo.rotko.net",
+  "wss://people-paseo.gatotech.network",
+  "wss://rpc.interweb-it.com/people-paseo",
+];
 
 export const ASSET_HUB_GENESIS = papiConfig.entries.paseo_next_v2.genesis as `0x${string}`;
 export const PEOPLE_GENESIS = papiConfig.entries.paseo_people_next.genesis as `0x${string}`;
@@ -17,19 +22,19 @@ export interface ChainTarget {
   /** Short name for logs and errors, e.g. "asset-hub". */
   label: string;
   genesisHash: `0x${string}`;
-  wsUrl: string;
+  wsUrls: string[];
 }
 
 export const ASSET_HUB: ChainTarget = {
   label: "asset-hub",
   genesisHash: ASSET_HUB_GENESIS,
-  wsUrl: ASSET_HUB_WS,
+  wsUrls: ASSET_HUB_WS,
 };
 
 export const PEOPLE: ChainTarget = {
   label: "people",
   genesisHash: PEOPLE_GENESIS,
-  wsUrl: PEOPLE_WS,
+  wsUrls: PEOPLE_WS,
 };
 
 // Bounds for the host probe and the liveness checks. Their sum stays under the quote UI's
@@ -112,14 +117,14 @@ async function dialChain(target: ChainTarget): Promise<PolkadotClient> {
 
   // Standalone (plain browser dev): speak to the RPC directly.
   const { getWsProvider } = await import("polkadot-api/ws");
-  const client = createClient(getWsProvider(target.wsUrl));
+  const client = createClient(getWsProvider(target.wsUrls));
   try {
     await verifyLive(client, target, "WebSocket", WS_LIVENESS_TIMEOUT_MS);
   } catch (e) {
     client.destroy();
     throw e instanceof Error ? e : new Error(String(e));
   }
-  console.info(`[chain] ${target.label}: direct WebSocket (${target.wsUrl})`);
+  console.info(`[chain] ${target.label}: direct WebSocket (${target.wsUrls.join(", ")})`);
   return client;
 }
 
