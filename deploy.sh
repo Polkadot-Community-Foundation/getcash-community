@@ -2,14 +2,14 @@
 #
 # deploy.sh: build and publish the static app to bulletin/DotNS.
 #
-# Usage:   ./deploy.sh [name.paseo]
-# Default: getcash.paseo
+# Usage:   ./deploy.sh [name.dot]
+# Default: getcash.dot
 #
 # Required env: MNEMONIC (the deploying account).
-# The name carries the environment's TLD: paseo-next-v2 serves ".paseo".
+# Target: PCF devnet (pad env `devnet`, Paseo AH 1000 / People 1004 / Bulletin 1010).
 set -euo pipefail
 
-NAME="${1:-getcash.paseo}"
+NAME="${1:-getcash.dot}"
 OUT=".output/public"
 
 # Deployer seed: MNEMONIC env wins; otherwise read VITE_DEPLOYER_SEED from .env.local or .env.
@@ -36,4 +36,5 @@ fi
 pnpm build:worker
 pnpm build
 # bulletin-deploy.config.ts reads the deploy target from this variable.
-DEPLOY_DOMAIN="$NAME" bulletin-deploy "$OUT" "$NAME" --env paseo-next-v2 --js-merkle
+DEPLOY_DOMAIN="$NAME" npx -y @polkadot-community-foundation/polkadot-app-deploy@0.16.7 \
+  "$OUT" "$NAME" --env devnet --js-merkle --config bulletin-deploy.config.ts

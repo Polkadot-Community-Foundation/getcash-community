@@ -1,8 +1,8 @@
 // Product manifest. `bulletin-deploy` writes the root manifest as the `manifest` record on the
 // base name and one `executable` record per entry on its own subname (`app.<domain>`,
-// `worker.<domain>`). DEPLOY_DOMAIN selects the target name; unset means production.
+// `worker.<domain>`). DEPLOY_DOMAIN selects the target name; unset means the PCF devnet name.
 export default {
-  domain: process.env.DEPLOY_DOMAIN || "getcash.paseo",
+  domain: process.env.DEPLOY_DOMAIN || "getcash.dot",
   displayName: "getcash",
   description: "Buy CASH into your private Polkadot App funds.",
   icon: { path: "brand/icon.png", format: "png" },

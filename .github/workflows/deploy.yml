@@ -1,26 +1,19 @@
 name: Deploy
 
-# Merge to main publishes straight to `getcash` on paseo-next-v2 and previewnet;
-# the gates in .github/actions/build-site are the only check. workflow_dispatch
-# redeploys main by hand, which is also how paritytech/autodeployer restores the
-# names after a testnet wipe.
+# PCF devnet: a push to `devnet` publishes `getcash.dot` on the pad `devnet` environment
+# (Paseo AH 1000 / People 1004 / Bulletin 1010). workflow_dispatch redeploys by hand.
 
 on:
   push:
-    branches: [main]
+    branches: [devnet]
   workflow_dispatch:
-    inputs:
-      network:
-        description: "Network to deploy; all on push, pick one for a targeted redeploy"
-        type: choice
-        default: all
-        options: [all, preview, paseo-next-v2]
+
 permissions:
   contents: read
 
 # Deploys write on-chain records. They queue and are never cancelled mid-flight.
 concurrency:
-  group: deploy-main
+  group: deploy-devnet
   cancel-in-progress: false
 
 jobs:
@@ -36,42 +29,10 @@ jobs:
           meld-base-url: ${{ secrets.VITE_MELD_BASE_URL }}
           meld-product-id: ${{ secrets.VITE_MELD_PRODUCT_ID }}
 
-  # Which network legs this run deploys: every target on push, the chosen one
-  # on a targeted redeploy (paritytech/autodeployer dispatches per network).
-  plan:
-    name: Pick networks
-    runs-on: ubuntu-latest
-    outputs:
-      targets: ${{ steps.plan.outputs.targets }}
-    steps:
-      - id: plan
-        env:
-          NETWORK: ${{ inputs.network || 'all' }}
-        run: |
-          targets=$(jq -c --arg n "$NETWORK" 'map(select($n == "all" or .env == $n))' <<'JSON'
-          [
-            {
-              "env": "paseo-next-v2",
-              "domain": "getcash.paseo"
-            },
-            {
-              "env": "preview",
-              "domain": "getcash.testnet"
-            }
-          ]
-          JSON
-          )
-          echo "targets=$targets" >> "$GITHUB_OUTPUT"
-          echo "$targets" | jq -r '.[] | "deploying " + .env'
-
   deploy:
-    needs: [build, plan]
-    name: getcash (${{ matrix.target.env }})
+    needs: build
+    name: getcash (devnet)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: ${{ fromJSON(needs.plan.outputs.targets) }}
     permissions:
       contents: read
     steps:
@@ -80,8 +41,7 @@ jobs:
 
       - uses: ./.github/actions/deploy-site
         with:
-          # The production name, with the environment's TLD.
-          domain: ${{ matrix.target.domain }}
-          env: ${{ matrix.target.env }}
-          # Owner of the getcash name; the account deploy.sh signs with locally.
+          domain: getcash.dot
+          env: devnet
+          # Owner of getcash.dot (5Fk8…).
           mnemonic: ${{ secrets.MNEMONIC }}

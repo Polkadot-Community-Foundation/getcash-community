@@ -4,7 +4,10 @@ name: PR Preview
 # bulletin-deploy strips trailing digits from a label. The first push registers the name, paid
 # by the MNEMONIC account; names are never released. Keep that account funded.
 
-on: pull_request
+# PCF fork: previews target PRs into main only; the devnet branch has no preview path yet.
+on:
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read

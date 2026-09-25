@@ -1,19 +1,19 @@
 name: Deploy site
 description: >-
-  Publish the built site and its product manifest to bulletin/DotNS. Runs bulletin-deploy
+  Publish the built site and its product manifest to bulletin/DotNS. Runs polkadot-app-deploy
   against .output/public from a repo checkout, reads bulletin-deploy.config.ts, and writes
   the manifest and the app/worker records alongside the content.
 
 inputs:
   domain:
-    description: Full DotNS name to deploy to, with TLD (e.g. pr21-getcash.paseo).
+    description: Full DotNS name to deploy to, with TLD (e.g. getcash.dot).
     required: true
   mnemonic:
     description: Owner of the name and signer of every record written.
     required: true
   env:
-    description: bulletin-deploy environment id the name lives on.
-    default: paseo-next-v2
+    description: polkadot-app-deploy environment id the name lives on.
+    default: devnet
 
 runs:
   using: composite
@@ -34,7 +34,7 @@ runs:
         node-version: "22"
 
     - shell: bash
-      run: npm install -g bulletin-deploy@latest
+      run: npm install -g @polkadot-community-foundation/polkadot-app-deploy@0.16.7
 
     # The release-retry wrapper exits 75 on flake-class failures only (a nonce race, a dropped
     # connection); only those retry.
@@ -49,5 +49,6 @@ runs:
         retry_wait_seconds: 30
         retry_on_exit_code: 75
         command: >-
-          node "$(npm root -g)/bulletin-deploy/tools/release-retry-wrapper.mjs"
-          bulletin-deploy --env "$DEPLOY_ENV" --js-merkle .output/public "$DEPLOY_DOMAIN"
+          node "$(npm root -g)/@polkadot-community-foundation/polkadot-app-deploy/tools/release-retry-wrapper.mjs"
+          polkadot-app-deploy .output/public "$DEPLOY_DOMAIN" --env "$DEPLOY_ENV" --js-merkle
+          --config bulletin-deploy.config.ts --mnemonic "$MNEMONIC"
