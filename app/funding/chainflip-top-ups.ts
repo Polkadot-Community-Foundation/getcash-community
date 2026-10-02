@@ -1,5 +1,5 @@
 import { computed } from "vue";
-import { SOURCE_CHAINS } from "~~/lib/config";
+import { FUNDING_CHAINS } from "~~/lib/config";
 import { useFundingProgressClock } from "../composables/useFundingProgressClock";
 import { useRequestsStore } from "../stores/requests";
 import { useSessionStore } from "../stores/session";
@@ -28,7 +28,7 @@ function topUpDetails(
 ): FundingTopUpDetails {
   const network = record.chain
     ? {
-        label: SOURCE_CHAINS.find(({ chain }) => chain === record.chain)?.label ?? record.chain,
+        label: FUNDING_CHAINS.find(({ chain }) => chain === record.chain)?.label ?? record.chain,
         icon: networkIcon(record.chain),
       }
     : undefined;

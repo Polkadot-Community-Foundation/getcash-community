@@ -113,7 +113,14 @@ describe("flow store: deep-linked source", () => {
   it("changes nothing for an unknown one, so the choosing is not skipped", () => {
     const { flow } = setUp();
     expect(flow.selectSourceId("moonbeam-glmr")).toBe(false);
-    expect(flow.srcChain.chain).toBe("Bitcoin");
+    expect(flow.srcChain.chain).toBe("Polkadot");
+  });
+
+  it("preselects the direct DOT deposit", () => {
+    const { flow } = setUp();
+    expect(flow.selectSourceId("dot-assethub")).toBe(true);
+    expect(flow.srcChain.chain).toBe("Polkadot");
+    expect(flow.srcAsset).toBe("DOT");
   });
 });
 

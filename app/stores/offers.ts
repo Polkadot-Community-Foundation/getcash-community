@@ -11,7 +11,7 @@ import {
   type SourceFloorResult,
   type SourceOffer,
 } from "@getsome/chainflip";
-import { SOURCE_CHAINS, sourceIdFor } from "~~/lib/config";
+import { FUNDING_CHAINS, isDirectSourceId, sourceIdFor } from "~~/lib/config";
 import { learnSourceFloors } from "~~/lib/source-floors";
 import { isDemoBuild } from "../utils/demo";
 import { chainflipRailOn } from "../utils/rail";
@@ -183,6 +183,7 @@ export const useOffersStore = defineStore("offers", () => {
   );
 
   function tokenOffer(sourceId: SourceId): TokenOffer {
+    if (isDirectSourceId(sourceId)) return { state: "ungated" };
     if (!railEnabled.value) return { state: "rail-off" };
     const learned = floors.value?.get(sourceId);
     if (learned === undefined) return { state: "checking" };
@@ -207,7 +208,7 @@ export const useOffersStore = defineStore("offers", () => {
 
   /** Every UI network, in catalog order, with its tokens for the purchase on screen. */
   const networks = computed<NetworkRow[]>(() =>
-    SOURCE_CHAINS.map((chain) => {
+    FUNDING_CHAINS.map((chain) => {
       const tokens: TokenRow[] = [];
       for (const asset of chain.assets) {
         const sourceId = sourceIdFor(chain.chain, asset);

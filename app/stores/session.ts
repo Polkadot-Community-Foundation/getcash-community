@@ -26,6 +26,7 @@ import {
   createFakeMeldClient,
   createMeldClient,
   createMeldRail,
+  formatNative,
   NATIVE_DECIMALS,
   pickBestQuote,
   type MeldClientLike,
@@ -59,7 +60,7 @@ import { isMeldSourceId, meldSourceIdFor } from "../funding/source-ids";
 import { toCashBase } from "../utils/cash";
 import { isMoneyAmount, sumMoney } from "../utils/money";
 import { fundFromFaucet, isFaucetConfigured } from "~~/lib/faucet";
-import { sourceIdFor } from "~~/lib/config";
+import { isDirectSourceId, sourceIdFor } from "~~/lib/config";
 import { useRequestsStore } from "./requests";
 
 export { DEPOSIT_EXPIRED_REASON } from "../funding/requests/model";
@@ -401,7 +402,7 @@ export const useSessionStore = defineStore("session", () => {
     epoch: number,
   ) {
     const sourceId = sourceIdFor(chain, asset);
-    if (sourceId === undefined) return;
+    if (sourceId === undefined || isDirectSourceId(sourceId)) return;
     sourcePrice.value = { kind: "pending" };
     void priceSourceLeg({ sourceId, targetNativeBase }).then((result) => {
       if (epoch === quoteEpoch) sourcePrice.value = result;
@@ -897,11 +898,16 @@ export const useSessionStore = defineStore("session", () => {
           loading.value = false;
           return;
         }
+        // The direct deposit quotes the native itself, as it does in the host.
+        const rail = isDirectSourceId(sourceId)
+          ? (await import("@getsome/funding")).createManualRail()
+          : undefined;
         const world = await createMockCoinageSession({
           recipient: DEV_RECIPIENT,
           amount: amountBase.value,
           sourceId,
           tradeN: nextMockTradeN(sourceId),
+          ...(rail === undefined ? {} : { rail }),
         });
         await world.session.ready;
         const quote = await world.session.quote();
@@ -964,13 +970,19 @@ export const useSessionStore = defineStore("session", () => {
           cfg && amountBase.value !== null
             ? estimateSourceFromCash(amountBase.value, cfg.asset)
             : null;
-        quoted.value = {
-          send: est ?? quote.source.formatted,
-          symbol: est && cfg ? cfg.asset : quote.source.assetSymbol,
-          nativeAmount,
-          sourceAsset: est && cfg ? cfg.asset : null,
-          sourceChain: chain,
-        };
+        // The direct deposit is the pool figure itself.
+        const direct =
+          isDirectSourceId(sourceId) && nativeAmount !== null ? formatNative(nativeAmount) : null;
+        quoted.value =
+          direct !== null
+            ? { send: direct, symbol: asset, nativeAmount, sourceAsset: asset, sourceChain: chain }
+            : {
+                send: est ?? quote.source.formatted,
+                symbol: est && cfg ? cfg.asset : quote.source.assetSymbol,
+                nativeAmount,
+                sourceAsset: est && cfg ? cfg.asset : null,
+                sourceChain: chain,
+              };
         // The swap network's quote endpoint is public; it needs the pool figure above as its
         // target.
         if (nativeAmount !== null) priceSelectedSource(chain, asset, nativeAmount, epoch);

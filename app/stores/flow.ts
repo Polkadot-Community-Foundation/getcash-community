@@ -3,7 +3,7 @@
 
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
-import { SOURCE_CHAINS, sourceIdFor } from "~~/lib/config";
+import { FUNDING_CHAINS, sourceIdFor } from "~~/lib/config";
 import { useOffersStore } from "./offers";
 import { useRequestsStore } from "./requests";
 import { useSessionStore } from "./session";
@@ -44,7 +44,7 @@ export const useFlowStore = defineStore("flow", () => {
   /** Demo deck only: the drill-in a scene wants open. See `PreviewDrillIn`. */
   const previewDrillIn = ref<PreviewDrillIn | null>(null);
 
-  const srcChain = computed(() => SOURCE_CHAINS[srcChainIndex.value] ?? SOURCE_CHAINS[0]);
+  const srcChain = computed(() => FUNDING_CHAINS[srcChainIndex.value] ?? FUNDING_CHAINS[0]);
   const srcAsset = computed(
     () => srcChain.value.assets[srcAssetIndex.value] ?? srcChain.value.assets[0],
   );
@@ -63,9 +63,9 @@ export const useFlowStore = defineStore("flow", () => {
 
   /** Picks network and token in one move, with a single re-quote. */
   function selectSource(chain: string, asset: string) {
-    const c = SOURCE_CHAINS.findIndex((entry) => entry.chain === chain);
+    const c = FUNDING_CHAINS.findIndex((entry) => entry.chain === chain);
     if (c < 0) return;
-    const a = (SOURCE_CHAINS[c]!.assets as readonly string[]).indexOf(asset);
+    const a = (FUNDING_CHAINS[c]!.assets as readonly string[]).indexOf(asset);
     if (a < 0) return;
     // Re-quote unless the pickers already point here and the quote on hand is for this source.
     const quotedHere =
@@ -94,9 +94,9 @@ export const useFlowStore = defineStore("flow", () => {
    * the token step.
    */
   function pickNetwork(chain: string): Step | null {
-    const c = SOURCE_CHAINS.findIndex((entry) => entry.chain === chain);
+    const c = FUNDING_CHAINS.findIndex((entry) => entry.chain === chain);
     const tokens = offers.offeredTokens(chain);
-    if (c >= 0 && tokens.length === 1 && tokens[0]!.asset === SOURCE_CHAINS[c]!.native) {
+    if (c >= 0 && tokens.length === 1 && tokens[0]!.asset === FUNDING_CHAINS[c]!.native) {
       selectSource(chain, tokens[0]!.asset);
       void startPurchase();
       return null;
@@ -107,8 +107,8 @@ export const useFlowStore = defineStore("flow", () => {
 
   /** Preselects the source from a SourceId. False when the catalog does not know it. */
   function selectSourceId(sourceId: string): boolean {
-    for (let c = 0; c < SOURCE_CHAINS.length; c++) {
-      const chain = SOURCE_CHAINS[c]!;
+    for (let c = 0; c < FUNDING_CHAINS.length; c++) {
+      const chain = FUNDING_CHAINS[c]!;
       for (let a = 0; a < chain.assets.length; a++) {
         if (sourceIdFor(chain.chain, chain.assets[a]!) === sourceId) {
           setSource(c, a);
