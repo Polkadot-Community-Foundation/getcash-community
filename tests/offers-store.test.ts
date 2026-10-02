@@ -29,6 +29,10 @@ function sized(session: ReturnType<typeof useSessionStore>, nativeAmount: bigint
   session.quoted = { send: "", symbol: "DOT", nativeAmount, sourceAsset: null, sourceChain: null };
 }
 
+/** The Chainflip networks: everything but the direct Polkadot one, which needs no floor. */
+const viaChainflip = (networks: { chain: string }[]) =>
+  networks.filter((n) => n.chain !== "Polkadot");
+
 const LEARNED = new Map<SourceId, SourceFloorResult>([
   ["btc", floor("btc", 40_000n, 160n)], // needs 160 DOT: too small for 100
   ["eth", floor("eth", 10n ** 16n, 25n)], // 25 DOT: fine
@@ -48,8 +52,8 @@ describe("offers store", () => {
     const session = useSessionStore();
     const offers = useOffersStore();
     sized(session, 100n * DOT);
-    expect(offers.networks.every((n) => n.checking && !n.available)).toBe(true);
-    expect(offers.offeredNetworks).toHaveLength(4); // still worth showing, as pending
+    expect(viaChainflip(offers.networks).every((n) => n.checking && !n.available)).toBe(true);
+    expect(offers.offeredNetworks).toHaveLength(5); // still worth showing, as pending
     expect(offers.paused).toBe(false);
   });
 
@@ -59,7 +63,7 @@ describe("offers store", () => {
     sized(session, 100n * DOT);
     offers.floors = LEARNED;
 
-    expect(offers.offeredNetworks.map((n) => n.chain)).toEqual(["Ethereum"]);
+    expect(offers.offeredNetworks.map((n) => n.chain)).toEqual(["Polkadot", "Ethereum"]);
     expect(offers.offeredTokens("Ethereum").map((t) => t.asset)).toEqual(["ETH", "USDT"]);
     expect(offers.offeredTokens("Bitcoin")).toEqual([]);
     expect(offers.paused).toBe(false);
@@ -103,7 +107,12 @@ describe("offers store", () => {
     const offers = useOffersStore();
     sized(session, null);
     offers.floors = LEARNED;
-    expect(offers.offeredNetworks.map((n) => n.chain)).toEqual(["Bitcoin", "Ethereum", "Solana"]);
+    expect(offers.offeredNetworks.map((n) => n.chain)).toEqual([
+      "Polkadot",
+      "Bitcoin",
+      "Ethereum",
+      "Solana",
+    ]);
     expect(offers.offeredTokens("Bitcoin")[0]!.offer).toEqual({ state: "ungated" });
     // Chainflip's own no is still a no.
     expect(offers.offeredTokens("Tron")).toEqual([]);
@@ -118,7 +127,8 @@ describe("offers store", () => {
       [...LEARNED.keys()].map((id) => [id, { kind: "unavailable", reason: "maintenance" }]),
     );
     expect(offers.paused).toBe(true);
-    expect(offers.offeredNetworks).toEqual([]);
+    // Only the direct deposit, which never asks Chainflip.
+    expect(offers.offeredNetworks.map((n) => n.chain)).toEqual(["Polkadot"]);
   });
 
   // TODO(production): delete with the fallback.
@@ -132,6 +142,7 @@ describe("offers store", () => {
     );
     expect(offers.paused).toBe(true); // still the truth about Chainflip
     expect(offers.offeredNetworks.map((n) => n.chain)).toEqual([
+      "Polkadot",
       "Bitcoin",
       "Ethereum",
       "Solana",
@@ -182,15 +193,25 @@ describe("offers store", () => {
     // Nothing is ever learned in this build; the rows still say so.
     expect(offers.awaitingFloors).toBe(false);
     expect(
-      offers.networks.flatMap((n) => n.tokens).every((t) => t.offer.state === "rail-off"),
+      viaChainflip(offers.networks)
+        .flatMap((n) => offers.tokensOf(n.chain))
+        .every((t) => t.offer.state === "rail-off"),
     ).toBe(true);
-    offers.floors = LEARNED; // whatever Chainflip said, nothing is pickable
-    expect(offers.networks).toHaveLength(4);
-    expect(offers.networks.every((n) => !n.available && !n.checking)).toBe(true);
+    offers.floors = LEARNED; // whatever Chainflip said, no Chainflip route is pickable
+    expect(offers.networks).toHaveLength(5);
     expect(
-      offers.networks.flatMap((n) => n.tokens).every((t) => t.offer.state === "rail-off"),
+      offers.networks
+        .filter((n) => n.chain !== "Polkadot")
+        .every((n) => !n.available && !n.checking),
     ).toBe(true);
-    expect(offers.offeredNetworks).toEqual([]);
+    expect(
+      viaChainflip(offers.networks)
+        .flatMap((n) => offers.tokensOf(n.chain))
+        .every((t) => t.offer.state === "rail-off"),
+    ).toBe(true);
+    // The direct deposit stays open: it does not move money through Chainflip.
+    expect(offers.offeredNetworks.map((n) => n.chain)).toEqual(["Polkadot"]);
+    expect(offers.offeredTokens("Polkadot")[0]!.offer).toEqual({ state: "ungated" });
     expect(offers.offeredTokens("Ethereum")).toEqual([]);
     expect(offers.paused).toBe(false);
   });

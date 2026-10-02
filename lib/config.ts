@@ -38,6 +38,23 @@ export const SOURCE_CHAINS = [
   { chain: CHAINS.Tron, native: ASSETS.TRX, assets: [ASSETS.TRX, ASSETS.USDT], label: "Tron" },
 ] as const;
 
+/** The direct network: the buyer sends the native from any wallet to the request's own account
+ *  on Asset Hub, through the manual rail. Funding only; withdraw keeps its own Asset Hub entry. */
+export const POLKADOT_CHAIN = {
+  chain: CHAINS.Polkadot,
+  native: ASSETS.DOT,
+  assets: [ASSETS.DOT],
+  label: "Polkadot",
+} as const;
+
+/** The on-ramp's networks in picker order: the direct one first, then the Chainflip ones. */
+export const FUNDING_CHAINS = [POLKADOT_CHAIN, ...SOURCE_CHAINS] as const;
+
+/** The direct deposit's SourceId: the manual rail's. */
+export const DIRECT_SOURCE_ID = "dot-assethub" satisfies SourceId;
+
+export const isDirectSourceId = (sourceId: string): boolean => sourceId === DIRECT_SOURCE_ID;
+
 // The destination is always CASH; this app has no other destination assets.
 
 /** Whether this build moves money through Chainflip. Off until the channel rail lands: the
@@ -60,5 +77,6 @@ export const SOURCE_ID_BY_KEY: Readonly<Record<string, SourceId>> = {
 };
 
 export function sourceIdFor(chain: string, asset: string): SourceId | undefined {
+  if (chain === CHAINS.Polkadot && asset === ASSETS.DOT) return DIRECT_SOURCE_ID;
   return SOURCE_ID_BY_KEY[`${chain}:${asset}`];
 }
