@@ -28,6 +28,7 @@ jobs:
           faucet-seed: ${{ secrets.VITE_FAUCET_SEED }}
           meld-base-url: ${{ secrets.VITE_MELD_BASE_URL }}
           meld-product-id: ${{ secrets.VITE_MELD_PRODUCT_ID }}
+          test-network-notice: "true"
 
   deploy:
     needs: build
