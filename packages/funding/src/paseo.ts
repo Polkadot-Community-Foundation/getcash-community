@@ -1,10 +1,12 @@
-// PCF devnet (Paseo) chain facts for the funding pipeline.
+// Chain facts for the funding pipeline.
 
-/** The coinage underlying on Paseo Asset Hub (on-chain symbol pUSD on devnet), pallet-assets u32 id. */
-export const PASEO_UNDERLYING_ASSET_ID = 50_000_413;
+import { NETWORK, TOKENS } from "@getsome/core";
 
-/** Paseo People parachain id (ParachainInfo). */
-export const PASEO_PEOPLE_PARA_ID = 1004;
+/** The coinage underlying on Asset Hub Next (on-chain symbol CASH), pallet-assets u32 id. */
+export const PASEO_UNDERLYING_ASSET_ID = TOKENS.CASH.assetHubId;
 
-/** Paseo Asset Hub parachain id (ParachainInfo). */
-export const PASEO_ASSET_HUB_PARA_ID = 1000;
+/** People parachain id (ParachainInfo). */
+export const PASEO_PEOPLE_PARA_ID = NETWORK.people.paraId;
+
+/** Asset Hub parachain id (ParachainInfo). */
+export const PASEO_ASSET_HUB_PARA_ID = NETWORK.assetHub.paraId;

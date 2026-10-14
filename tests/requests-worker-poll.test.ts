@@ -4,9 +4,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { projectChainflipTopUps } from "../app/funding/chainflip-top-ups";
-import { progressProviderForSource } from "../app/funding/progress";
 import { migrateRecord } from "../app/funding/requests/migrate";
-import { JOB_POLL_MS, setRequestsClock, type RequestRecord } from "../app/funding/requests/model";
+import {
+  JOB_POLL_CLAIMING_MS,
+  JOB_POLL_MS,
+  setRequestsClock,
+  type RequestRecord,
+} from "../app/funding/requests/model";
 import {
   createMemoryKeyedStorage,
   REQUEST_INDEX_KEY,
@@ -33,6 +37,7 @@ import {
   fixtureRecords,
   fixtureWorkerJobs,
   fixtureWorkerJobsBlob,
+  fundedCryptoRecord,
   settledCardRecord,
   submittedCardRecord,
   type WorkerJobRecord,
@@ -103,11 +108,71 @@ async function stored(ref: RequestRef): Promise<Record<string, unknown> | null> 
   return raw === null ? null : (JSON.parse(raw) as Record<string, unknown>);
 }
 
+/** Moves the store's clock and the fake timers on by `ms` together. */
+async function elapse(ms: number): Promise<void> {
+  now += ms;
+  await vi.advanceTimersByTimeAsync(ms);
+}
+
 const AWAITING_REF = refOf(awaitingDepositCryptoRecord);
 /** The worker's job for the awaiting crypto request: armed, no deposit yet. */
 const AWAITING_JOB = fixtureWorkerJobs["dot-assethub:3"]!;
 /** A blob with that one job, so nothing else gets a record. */
 const AWAITING_JOB_BLOB = JSON.stringify({ "dot-assethub:3": AWAITING_JOB });
+const FUNDED_REF = refOf(fundedCryptoRecord);
+/** The worker's job for the funded crypto request: converting. */
+const FUNDED_JOB = fixtureWorkerJobs["dot-assethub:4"]!;
+
+/** `job` once the worker converted the deposit, with `claim` as the worker records it. */
+function doneJob(
+  job: WorkerJobRecord,
+  at: number,
+  claim: NonNullable<WorkerJobRecord["claim"]>,
+): WorkerJobRecord {
+  return {
+    ...job,
+    phase: "done",
+    done: true,
+    lastTickAt: at,
+    state: {
+      ...job.state,
+      swapSubmitted: true,
+      xcmSubmitted: true,
+      fundsSeenAt: job.state.fundsSeenAt ?? at - 60_000,
+    },
+    claim,
+  };
+}
+
+/** Boots the store over the awaiting request and has the worker convert it and register its
+ *  claim, read on the poll's next 6 s tick: from here the claim is in flight. Returns the store
+ *  and the blob reads so far. */
+async function bootIntoClaim(): Promise<{
+  requests: ReturnType<typeof useRequestsStore>;
+  reads: number;
+}> {
+  vi.useFakeTimers();
+  await seed([awaitingDepositCryptoRecord], AWAITING_JOB_BLOB);
+  const requests = useRequestsStore();
+  await requests.reconcile("boot");
+  await requests.flush();
+  const readsAtBoot = host.blobReads();
+
+  const registeredAt = FIXTURE_NOW + 5_000;
+  await writeJobs({
+    "dot-assethub:3": doneJob(AWAITING_JOB, registeredAt, {
+      phase: "claiming",
+      amount: "25250000",
+      at: registeredAt,
+      attempts: 1,
+    }),
+  });
+  await elapse(JOB_POLL_MS);
+  expect(host.blobReads()).toBe(readsAtBoot + 1);
+  expect(requests.get(AWAITING_REF)).toMatchObject({ status: { kind: "claiming" } });
+  expect(requests.get(AWAITING_REF)).not.toHaveProperty("creditedAt");
+  return { requests, reads: readsAtBoot + 1 };
+}
 
 describe("requests store: the worker poll", () => {
   beforeEach(() => {
@@ -198,6 +263,54 @@ describe("requests store: the worker poll", () => {
     });
   });
 
+  it("poll carries the worker's facts past the deposit and drops a malformed one", async () => {
+    vi.useFakeTimers();
+    await seed([awaitingDepositCryptoRecord], AWAITING_JOB_BLOB);
+    const requests = useRequestsStore();
+    await requests.reconcile("boot");
+
+    const tickAt = FIXTURE_NOW + 3_000;
+    const job = doneJob(AWAITING_JOB, tickAt, {
+      phase: "claiming",
+      amount: "25250000",
+      at: tickAt,
+      attempts: 1,
+    });
+    // The worker's blob as it stores it, with a conversion block that is not a number.
+    await host.storage.write(
+      WORKER_JOBS_KEY,
+      JSON.stringify({
+        "dot-assethub:3": {
+          ...job,
+          state: { ...job.state, psmRefusals: 2, workedMs: 45_000 },
+          claim: { ...job.claim, registeredAt: tickAt, workedMs: 6_000, credited: "10000000" },
+          depositSeen: { block: 10, finalizedAtSeen: 8, finalized: 10, best: 12 },
+          conversion: {
+            preparedAt: tickAt,
+            converted: { txHash: "0xaa", block: "12", at: tickAt, workedMs: 30_000 },
+          },
+        },
+      }),
+    );
+    await elapse(JOB_POLL_MS);
+
+    const record = requests.get(AWAITING_REF);
+    expect(record).toMatchObject({
+      depositInBlock: { block: 10, finalizedAtSeen: 8, finalized: 10, best: 12 },
+      conversionPreparedAt: tickAt,
+      claimRegisteredAt: tickAt,
+      witnesses: {
+        worker: {
+          psmRefusals: 2,
+          claimCredited: "10000000",
+          workedMs: 45_000,
+          claimWorkedMs: 6_000,
+        },
+      },
+    });
+    expect(record).not.toHaveProperty("converted");
+  });
+
   it("a job without a record creates a record with the job's amount and deadline", async () => {
     await seed(fixtureRecords);
     const requests = useRequestsStore();
@@ -211,7 +324,7 @@ describe("requests store: the worker poll", () => {
       kind: "top-up",
       ref,
       amountHuman: "12",
-      chain: "AssetHub",
+      chain: "Polkadot",
       asset: "DOT",
       startedAt: job.createdAt,
       depositAddress: job.burnerAddress,
@@ -238,17 +351,6 @@ describe("requests store: the worker poll", () => {
         clock: { at: FIXTURE_NOW },
       },
       confirmedAt: FIXTURE_NOW,
-    });
-    // Today's default crypto snapshot: no quote to size the ingress from.
-    const profile = progressProviderForSource("dot-assethub").createProfile();
-    const journeyMs =
-      profile.expectedUserDelayMs +
-      profile.stages.reduce((total, stage) => total + stage.nominalMs, 0);
-    expect(record?.progress).toMatchObject({
-      profile: { id: "chainflip" },
-      stageTimestamps: {},
-      preDetectionEstimateText: "≈10 min after your transfer",
-      estimatedCompletionAt: job.createdAt + journeyMs,
     });
     expect(record).not.toHaveProperty("deposit");
     expect(record).not.toHaveProperty("refundAddress");
@@ -282,10 +384,9 @@ describe("requests store: the worker poll", () => {
       route: "crypto",
       startedAt: job.createdAt,
       details: {
-        network: { label: "AssetHub" },
+        network: { label: "Polkadot" },
         token: { label: "DOT" },
         depositAddress: job.burnerAddress,
-        arrivalEstimate: "≈10 min after your transfer",
       },
     });
     expect(row).not.toHaveProperty("quote");
@@ -338,6 +439,110 @@ describe("requests store: the worker poll", () => {
     await requests.flush();
     expect(host.blobReads()).toBe(readsAtBoot + 2);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("poll reads the blob every second while a top-up's claim is in flight", async () => {
+    const { requests, reads } = await bootIntoClaim();
+    // The claim's own timer took the 6 s one's place: the poll and the second hand, no more.
+    expect(vi.getTimerCount()).toBe(2);
+
+    await elapse(JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(reads + 1);
+    await elapse(JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(reads + 2);
+    // Through the instant a stale 6 s timer would have fired: one read a second, no extra.
+    await elapse(4 * JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(reads + 6);
+    expect(vi.getTimerCount()).toBe(2);
+    expect(requests.get(AWAITING_REF)).toMatchObject({ status: { kind: "claiming" } });
+  });
+
+  it("poll goes back to 6 s once the host's early word is on the record", async () => {
+    const { requests, reads } = await bootIntoClaim();
+
+    // The host reports the claim in a block: credited, while the record stays `claiming`.
+    const creditedAt = now + 500;
+    await writeJobs({
+      "dot-assethub:3": doneJob(AWAITING_JOB, creditedAt, {
+        phase: "claiming",
+        amount: "25250000",
+        at: creditedAt,
+        attempts: 1,
+        status: "claimed",
+      }),
+    });
+    await elapse(JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(reads + 1);
+    expect(requests.get(AWAITING_REF)).toMatchObject({ status: { kind: "claiming" }, creditedAt });
+
+    // One read per 6 s from here, on one timer.
+    await elapse(JOB_POLL_MS - JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(reads + 1);
+    await elapse(JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(reads + 2);
+    await requests.flush();
+    expect(vi.getTimerCount()).toBe(2);
+  });
+
+  it("poll goes back to 6 s once the claiming request settles and another is still followed", async () => {
+    vi.useFakeTimers();
+    await seed(
+      [awaitingDepositCryptoRecord, fundedCryptoRecord],
+      JSON.stringify({ "dot-assethub:3": AWAITING_JOB, "dot-assethub:4": FUNDED_JOB }),
+    );
+    const requests = useRequestsStore();
+    await requests.reconcile("boot");
+    await requests.flush();
+    const readsAtBoot = host.blobReads();
+
+    // The funded request's claim is registered: the poll reads every second.
+    const registeredAt = FIXTURE_NOW + 5_000;
+    const claim = { phase: "claiming" as const, amount: "40000000", at: registeredAt, attempts: 1 };
+    await writeJobs({
+      "dot-assethub:3": AWAITING_JOB,
+      "dot-assethub:4": doneJob(FUNDED_JOB, registeredAt, claim),
+    });
+    await elapse(JOB_POLL_MS);
+    expect(host.blobReads()).toBe(readsAtBoot + 1);
+    expect(requests.get(FUNDED_REF)).toMatchObject({ status: { kind: "claiming" } });
+    await elapse(JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(readsAtBoot + 2);
+
+    // The worker's final word settles it; the awaiting request keeps the poll running, at 6 s.
+    const settledAt = now + 500;
+    await writeJobs({
+      "dot-assethub:3": AWAITING_JOB,
+      "dot-assethub:4": doneJob(FUNDED_JOB, settledAt, {
+        ...claim,
+        phase: "claimed",
+        at: settledAt,
+        status: "claimed",
+      }),
+    });
+    await elapse(JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(readsAtBoot + 3);
+    expect(requests.get(FUNDED_REF)).toMatchObject({ status: { kind: "settled", at: settledAt } });
+    await elapse(JOB_POLL_MS - JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(readsAtBoot + 3);
+    await elapse(JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(readsAtBoot + 4);
+    await requests.flush();
+    expect(vi.getTimerCount()).toBe(2);
+  });
+
+  it("a hidden page pauses the claim's poll, and a return resumes it at the same pace", async () => {
+    const { requests, reads } = await bootIntoClaim();
+
+    requests.pausePolls();
+    await requests.flush();
+    expect(vi.getTimerCount()).toBe(0);
+    await elapse(3 * JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(reads);
+
+    requests.resumePolls();
+    await elapse(JOB_POLL_CLAIMING_MS);
+    expect(host.blobReads()).toBe(reads + 1);
+    expect(vi.getTimerCount()).toBe(2);
   });
 
   it("known:false leaves the record unchanged and records the witness", async () => {

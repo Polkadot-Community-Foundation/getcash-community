@@ -100,14 +100,10 @@ describe("preview scenes", () => {
         fundingNotice: requests.fundingNotice,
         claimStage: requests.claimStage,
         claimedBase: requests.claimedBase,
-        journeyDone: requests.journeyDone,
-        milestones: { ...requests.milestones },
         meldStage: requests.meldStage,
-        meldDelayed: requests.meldDelayed,
         meldFailureMessage: requests.meldFailureMessage,
         meldSubmitted: requests.meldSubmitted,
         meldHandedOff: requests.meldHandedOff,
-        foregroundSnapshot: requests.foregroundProgress?.snapshot,
       });
     }
     expect(views).toMatchSnapshot();
@@ -122,16 +118,12 @@ const REQUEST_VIEWS = [
   "fundingNotice",
   "claimStage",
   "claimedBase",
-  "foregroundProgress",
   "meldStage",
-  "meldDelayed",
   "meldFailureMessage",
   "meldSubmitted",
   "meldHandedOff",
   "fundsSeen",
   "claiming",
-  "journeyDone",
-  "milestones",
   "requestList",
   "requestStatus",
 ];
@@ -157,5 +149,19 @@ describe("session store", () => {
     ].flatMap((root) => sourceFiles(fileURLToPath(new URL(`../${root}`, import.meta.url))));
     const pattern = new RegExp(`\\bsession\\.(${REQUEST_VIEWS.join("|")})\\b`);
     expect(readers.filter((file) => pattern.test(readFileSync(file, "utf8")))).toEqual([]);
+  });
+});
+
+describe("requests store", () => {
+  it("reads a recorded route and never chooses one", () => {
+    // The tier is decided once, at quote time, in the session store. Every path in the requests
+    // store that rebuilds a hand-off or reads a burner takes the tier off what was persisted;
+    // a call site that asks the chain again is a bug this pins.
+    const store = readFileSync(
+      fileURLToPath(new URL("../app/stores/requests.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(store).not.toMatch(/\bchoose\w*Route\b/);
+    expect(store).toMatch(/\brecordedRoute\(/);
   });
 });

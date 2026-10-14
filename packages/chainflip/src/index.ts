@@ -7,8 +7,10 @@ export {
   type SourceConfig,
 } from "./sources";
 export {
+  DEFAULT_CHANNEL_LIFETIME_MS,
   openWithdrawChannel,
   quoteOutgoing,
+  type IncludedFee,
   type OpenWithdrawChannelArgs,
   type OutgoingDestination,
   type OutgoingQuote,
@@ -16,18 +18,15 @@ export {
 } from "./withdraw-channel";
 export {
   computeQuote,
+  egressFor,
   pickRegularQuote,
   ON_CHAIN_OVERHEAD_PLANCKS,
   SourceMinimumNotMetError,
+  type ChainflipToken,
+  type EgressConfig,
   type QuoteBackend,
 } from "./quote";
-export {
-  CHAINFLIP_PROGRESS_STATUSES,
-  getSwapStatus,
-  isImplicitFailure,
-  type ChainflipProgressStatus,
-  type StatusBackend,
-} from "./status";
+export { getSwapStatus, isImplicitFailure, type StatusBackend } from "./status";
 export { requestDepositAddress, type DepositBackend } from "./deposit";
 export { createLiquidityGate, type LiquidityGate } from "./gate";
 export {
@@ -41,7 +40,11 @@ export {
   type SourceOffer,
 } from "./floors";
 export {
+  BAAS_BROKER_HOST,
+  BAAS_COMMISSION_BPS,
+  baasBrokerUrl,
   createSwapSdk,
+  type CreateSwapSdkOptions,
   BelowMinimumSwapAmountError,
   ChainflipRequestError,
   normalizeQuoteRequestError,

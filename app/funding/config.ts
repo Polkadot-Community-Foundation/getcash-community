@@ -5,11 +5,13 @@ const symbol = "$";
 const ticker = "CASH";
 
 /** The currency as every sum and every prose mention writes it: the symbol on the figure, the
- *  ticker after it, and the token's name where prose names it rather than counts it ("Converting
- *  to $CASH"). The one place any of them changes with the branding. */
+ *  ticker after it as a logo, the word a sentence uses instead ("Adding $50 Cash"), and the token's
+ *  name where prose names it rather than counts it ("Converting to $CASH"). The one place any of
+ *  them changes with the branding. */
 export const currencyConfig = {
   symbol,
   ticker,
+  word: "Cash",
   name: `${symbol}${ticker}`,
 } as const;
 
@@ -42,7 +44,8 @@ export const fundingSelectorConfig = {
     decimals: 2,
     initial: "",
     minimum: "10",
-    maximum: "2000",
+    // The Add funds frame answers $1,000,000 with "Maximum 5,000 $CASH".
+    maximum: "5000",
     // The lowest preset sits on the minimum, so the floor is a tappable amount.
     presets: ["10", "50", "100"],
   },
@@ -73,6 +76,14 @@ export const fundingSelectorConfig = {
       depositWindowMs: 86_400_000,
     },
   ],
+} as const satisfies FundingSelectorConfig;
+
+export const withdrawalSelectorConfig = {
+  ...fundingSelectorConfig,
+  amount: {
+    ...fundingSelectorConfig.amount,
+    maximum: "2000",
+  },
 } as const satisfies FundingSelectorConfig;
 
 /** The route's deposit window, or the shared default for a route the config does not list. */

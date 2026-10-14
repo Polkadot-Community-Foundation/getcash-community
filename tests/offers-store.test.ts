@@ -1,37 +1,83 @@
 // The offers store projects the learned floors and the amount on screen into the networks and
-// tokens to show. These seed the floors directly.
+// tokens to show. These seed the floors directly; the one learn they let through is faked.
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import type { SourceId } from "@getsome/core";
-import type { SourceFloorResult } from "@getsome/chainflip";
+import { nextTick } from "vue";
+import { TOKENS, type SourceId } from "@getsome/core";
+import { egressFor, type SourceFloorResult } from "@getsome/chainflip";
 import { useOffersStore } from "../app/stores/offers";
 import { useSessionStore } from "../app/stores/session";
+import { learnSourceFloors } from "../lib/source-floors";
+
+vi.mock("../lib/source-floors", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/source-floors")>()),
+  learnSourceFloors: vi.fn(),
+}));
+
+const hosted = { value: false };
+vi.mock("../lib/host-account", () => ({ isHosted: () => hosted.value }));
 
 const DOT = 10_000_000_000n;
+const USDT = 1_000_000n;
 
-function floor(sourceId: SourceId, minimumBaseUnits: bigint, worthDot: bigint): SourceFloorResult {
+function floor(
+  sourceId: SourceId,
+  minimumBaseUnits: bigint,
+  worthDot: bigint,
+  unit = DOT,
+): SourceFloorResult {
   return {
     kind: "floor",
     floor: {
       sourceId,
       minimumBaseUnits,
-      minimumEgressBaseUnits: worthDot * DOT,
+      minimumEgressBaseUnits: worthDot * unit,
       etaSeconds: 600,
     },
   };
 }
 
-/** A 50 CASH purchase the pool sized at 100 DOT. */
+/** A 50 CASH purchase the pool sized at 100 DOT, or could not size when `nativeAmount` is null. */
 function sized(session: ReturnType<typeof useSessionStore>, nativeAmount: bigint | null) {
   session.setAmount("50");
   session.loading = false;
-  session.quoted = { send: "", symbol: "DOT", nativeAmount, sourceAsset: null, sourceChain: null };
+  session.quoted = {
+    send: "",
+    symbol: "DOT",
+    nativeAmount,
+    depositToken: TOKENS.PAS,
+    sourceAsset: null,
+    sourceChain: null,
+  };
 }
 
-/** The Chainflip networks: everything but the direct Polkadot one, which needs no floor. */
-const viaChainflip = (networks: { chain: string }[]) =>
-  networks.filter((n) => n.chain !== "Polkadot");
+/** The same purchase quoted as a direct USDC deposit: no figure in any asset the floors know. */
+function sizedInUsdc(session: ReturnType<typeof useSessionStore>) {
+  session.setAmount("50");
+  session.loading = false;
+  session.quoted = {
+    send: "50",
+    symbol: "USDC",
+    nativeAmount: null,
+    sourceAsset: "USDC",
+    sourceChain: "Polkadot",
+  };
+}
+
+/** The same purchase on the PSM tier: 50 CASH sized at 50 USDT. */
+function sizedInUsdt(session: ReturnType<typeof useSessionStore>) {
+  session.setAmount("50");
+  session.loading = false;
+  session.quoted = {
+    send: "",
+    symbol: "USDT",
+    nativeAmount: 50n * USDT,
+    depositToken: TOKENS.USDT,
+    sourceAsset: null,
+    sourceChain: null,
+  };
+}
 
 const LEARNED = new Map<SourceId, SourceFloorResult>([
   ["btc", floor("btc", 40_000n, 160n)], // needs 160 DOT: too small for 100
@@ -46,14 +92,65 @@ const LEARNED = new Map<SourceId, SourceFloorResult>([
 ]);
 
 describe("offers store", () => {
-  beforeEach(() => setActivePinia(createPinia()));
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    vi.mocked(learnSourceFloors).mockReset();
+    hosted.value = false;
+  });
 
-  it("is checking everything until the floors are learned", () => {
+  /** The Chainflip networks: everything but the direct one. */
+  const swapNetworks = (offers: ReturnType<typeof useOffersStore>) =>
+    offers.networks.filter((n) => n.chain !== "Polkadot");
+
+  it("offers the Polkadot tokens as direct deposits with no floor, before any floors and with the rail off", () => {
+    const session = useSessionStore();
+    const offers = useOffersStore();
+    offers.railEnabled = false;
+    sized(session, 100n * DOT);
+    const polkadot = offers.networks[0]!;
+    expect(polkadot).toMatchObject({ chain: "Polkadot", label: "Polkadot", available: true });
+    expect(polkadot.checking).toBe(false);
+    expect(polkadot.tokens).toEqual([
+      { asset: "DOT", sourceId: "dot-assethub", offer: { state: "direct" } },
+      { asset: "dotUSD", sourceId: "dotusd-assethub", offer: { state: "direct" } },
+      { asset: "USDT", sourceId: "usdt-assethub", offer: { state: "direct" } },
+      { asset: "USDC", sourceId: "usdc-assethub", offer: { state: "direct" } },
+    ]);
+    expect(offers.offeredTokens("Polkadot").map((t) => t.asset)).toEqual([
+      "DOT",
+      "dotUSD",
+      "USDT",
+      "USDC",
+    ]);
+    expect(offers.offeredNetworks.map((n) => n.chain)).toEqual(["Polkadot"]);
+  });
+
+  it("offers the swap rows as they are while a direct stable quote is on screen", () => {
+    const session = useSessionStore();
+    const offers = useOffersStore();
+    sizedInUsdc(session);
+    offers.floors = LEARNED;
+    // The quote names no figure the floors can be held against, so nothing is awaited: the rows
+    // are open, and the quote after a pick is what judges them. Chainflip's own no stays a no.
+    expect(offers.awaitingNetworks).toBe(false);
+    expect(offers.tokensOf("Ethereum").map((t) => t.offer.state)).toEqual([
+      "ungated",
+      "unavailable",
+      "ungated",
+    ]);
+    expect(offers.networks[0]!.tokens.every((t) => t.offer.state === "direct")).toBe(true);
+    // A quote back in the native prices the rows again.
+    sized(session, 100n * DOT);
+    expect(offers.offeredTokens("Ethereum").map((t) => t.asset)).toEqual(["ETH", "USDT"]);
+  });
+
+  it("is checking every swap network until the floors are learned", () => {
     const session = useSessionStore();
     const offers = useOffersStore();
     sized(session, 100n * DOT);
-    expect(viaChainflip(offers.networks).every((n) => n.checking && !n.available)).toBe(true);
+    expect(swapNetworks(offers).every((n) => n.checking && !n.available)).toBe(true);
     expect(offers.offeredNetworks).toHaveLength(5); // still worth showing, as pending
+    expect(offers.awaitingNetworks).toBe(true);
     expect(offers.paused).toBe(false);
   });
 
@@ -127,7 +224,7 @@ describe("offers store", () => {
       [...LEARNED.keys()].map((id) => [id, { kind: "unavailable", reason: "maintenance" }]),
     );
     expect(offers.paused).toBe(true);
-    // Only the direct deposit, which never asks Chainflip.
+    // The direct network does not depend on Chainflip.
     expect(offers.offeredNetworks.map((n) => n.chain)).toEqual(["Polkadot"]);
   });
 
@@ -175,14 +272,28 @@ describe("offers store", () => {
     expect(offers.tokensOf("Mars")).toEqual([]);
   });
 
-  it("shows skeleton rows only while an answer is actually awaited", () => {
+  it("has the pickers wait while the floors are being learned or the quote is sizing", () => {
+    const session = useSessionStore();
     const offers = useOffersStore();
-    expect(offers.awaitingFloors).toBe(true); // rail on, nothing learned yet
+    expect(offers.awaitingNetworks).toBe(true); // rail on, nothing learned yet
     offers.railEnabled = false;
-    expect(offers.awaitingFloors).toBe(false); // nothing will be asked: show the greyed rows
+    expect(offers.awaitingNetworks).toBe(false); // nothing will be asked: show the greyed rows
     offers.railEnabled = true;
     offers.floors = LEARNED;
-    expect(offers.awaitingFloors).toBe(false);
+    expect(offers.awaitingNetworks).toBe(true); // learned, but no quote has sized the amount
+    expect(offers.awaitingTokens("Polkadot")).toBe(false); // the direct rows never wait
+    expect(offers.awaitingTokens("Ethereum")).toBe(true);
+    sized(session, 100n * DOT);
+    expect(offers.awaitingNetworks).toBe(false);
+    expect(offers.awaitingTokens("Ethereum")).toBe(false);
+    // A re-quote clears the quote on hand: the rows wait for the new one.
+    session.quoted = null;
+    session.loading = true;
+    expect(offers.awaitingNetworks).toBe(true);
+    // A quote that failed is an answer: the rows show, as they are.
+    session.loading = false;
+    session.quoteError = "down";
+    expect(offers.awaitingNetworks).toBe(false);
   });
 
   it("greys every route while the build does not move money through Chainflip", () => {
@@ -190,29 +301,103 @@ describe("offers store", () => {
     const offers = useOffersStore();
     offers.railEnabled = false; // a real build before the channel rail
     sized(session, 100n * DOT);
-    // Nothing is ever learned in this build; the rows still say so.
-    expect(offers.awaitingFloors).toBe(false);
+    // Nothing is ever learned in this build; the swap rows still say so.
+    expect(offers.awaitingNetworks).toBe(false);
     expect(
-      viaChainflip(offers.networks)
-        .flatMap((n) => offers.tokensOf(n.chain))
+      swapNetworks(offers)
+        .flatMap((n) => n.tokens)
         .every((t) => t.offer.state === "rail-off"),
     ).toBe(true);
-    offers.floors = LEARNED; // whatever Chainflip said, no Chainflip route is pickable
+    offers.floors = LEARNED; // whatever Chainflip said, no swap route is pickable
     expect(offers.networks).toHaveLength(5);
+    expect(swapNetworks(offers).every((n) => !n.available && !n.checking)).toBe(true);
     expect(
-      offers.networks
-        .filter((n) => n.chain !== "Polkadot")
-        .every((n) => !n.available && !n.checking),
-    ).toBe(true);
-    expect(
-      viaChainflip(offers.networks)
-        .flatMap((n) => offers.tokensOf(n.chain))
+      swapNetworks(offers)
+        .flatMap((n) => n.tokens)
         .every((t) => t.offer.state === "rail-off"),
     ).toBe(true);
-    // The direct deposit stays open: it does not move money through Chainflip.
+    // The direct deposit is the one route such a build moves money through.
     expect(offers.offeredNetworks.map((n) => n.chain)).toEqual(["Polkadot"]);
-    expect(offers.offeredTokens("Polkadot")[0]!.offer).toEqual({ state: "ungated" });
     expect(offers.offeredTokens("Ethereum")).toEqual([]);
     expect(offers.paused).toBe(false);
+  });
+
+  it("compares a PSM-tier quote against floors worth in its own asset, kept apart from the pool's", () => {
+    const session = useSessionStore();
+    const offers = useOffersStore();
+    sized(session, 100n * DOT);
+    offers.floors = LEARNED;
+
+    sizedInUsdt(session);
+    expect(offers.floors).toBeNull(); // nothing learned in USDT yet
+    offers.floors = new Map<SourceId, SourceFloorResult>([
+      ["btc", floor("btc", 40_000n, 160n, USDT)], // needs 160 USDT: too small for 50
+      ["eth", floor("eth", 10n ** 16n, 25n, USDT)], // 25 USDT: fine
+    ]);
+    const eth = offers.offeredTokens("Ethereum")[0]!.offer;
+    expect(eth.state).toBe("available");
+    // 50 USDT at 0.01 ETH per 25 USDT = 0.02 ETH, plus the 5% buffer.
+    if (eth.state === "available") expect(eth.offer.sendBaseUnits).toBe(21_000_000_000_000_000n);
+    const btc = offers.networks.find((n) => n.chain === "Bitcoin")!.tokens[0]!.offer;
+    // 50 CASH bought 50 USDT and the floor is worth 160 USDT: the smallest purchase is 160 CASH.
+    expect(btc).toEqual({ state: "too-small", minimumCashBase: 160_000_000n });
+
+    sized(session, 100n * DOT); // back on the pool tier: its floors were kept
+    expect(offers.floors).toBe(LEARNED);
+  });
+
+  it("asks for the tier's own asset before a quote has said, so the usual route costs one load", async () => {
+    // Guessing the pool's native spent a load on floors the PSM route never uses.
+    hosted.value = true;
+    vi.mocked(learnSourceFloors).mockResolvedValue(LEARNED);
+    await useOffersStore().learn();
+    expect(learnSourceFloors).toHaveBeenCalledWith({ egress: egressFor(TOKENS.USDT) });
+
+    setActivePinia(createPinia());
+    hosted.value = false;
+    await useOffersStore().learn();
+    expect(learnSourceFloors).toHaveBeenLastCalledWith({ egress: egressFor(TOKENS.PAS) });
+  });
+
+  it("drops an answer for floors that were seeded while it was in flight", async () => {
+    const session = useSessionStore();
+    const offers = useOffersStore();
+    sized(session, 100n * DOT);
+    const outage = new Map<SourceId, SourceFloorResult>([["eth", { kind: "unavailable" }]]);
+    let answer: (v: ReadonlyMap<SourceId, SourceFloorResult>) => void = () => {};
+    vi.mocked(learnSourceFloors).mockReturnValueOnce(new Promise((resolve) => (answer = resolve)));
+
+    const load = offers.learn();
+    expect(offers.learning).toBe(true);
+    offers.floors = LEARNED;
+    answer(outage);
+    await load;
+
+    expect(offers.floors).toBe(LEARNED);
+    expect(offers.learning).toBe(false);
+  });
+
+  it("learns the floors for an asset the first time a quote is sized in it", async () => {
+    const session = useSessionStore();
+    const offers = useOffersStore();
+    sized(session, 100n * DOT);
+    offers.floors = LEARNED;
+    const usdtFloors = new Map<SourceId, SourceFloorResult>([
+      ["eth", floor("eth", 10n ** 16n, 25n, USDT)],
+    ]);
+    vi.mocked(learnSourceFloors).mockResolvedValueOnce(usdtFloors);
+
+    sizedInUsdt(session);
+    await nextTick();
+    expect(learnSourceFloors).toHaveBeenCalledWith({ egress: egressFor(TOKENS.USDT) });
+    expect(offers.learning).toBe(true);
+    await offers.learn(); // joins the load in flight
+    expect(offers.learning).toBe(false);
+    expect(offers.floors).toBe(usdtFloors);
+    expect(offers.offeredTokens("Ethereum")[0]!.offer.state).toBe("available");
+    // The pool tier's floors, already learned, are not asked for again.
+    sized(session, 100n * DOT);
+    await nextTick();
+    expect(learnSourceFloors).toHaveBeenCalledTimes(1);
   });
 });

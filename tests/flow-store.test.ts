@@ -116,11 +116,16 @@ describe("flow store: deep-linked source", () => {
     expect(flow.srcChain.chain).toBe("Polkadot");
   });
 
-  it("preselects the direct DOT deposit", () => {
+  it("preselects a direct Polkadot source, and points at a pair by name without quoting", () => {
     const { flow } = setUp();
-    expect(flow.selectSourceId("dot-assethub")).toBe(true);
+    expect(flow.selectSourceId("usdc-assethub")).toBe(true);
     expect(flow.srcChain.chain).toBe("Polkadot");
-    expect(flow.srcAsset).toBe("DOT");
+    expect(flow.srcAsset).toBe("USDC");
+    expect(flow.setSourceByName("Tron", "USDT")).toBe(true);
+    expect(flow.srcChain.chain).toBe("Tron");
+    expect(flow.srcAsset).toBe("USDT");
+    expect(flow.setSourceByName("Polkadot", "BTC")).toBe(false);
+    expect(flow.srcChain.chain).toBe("Tron");
   });
 });
 

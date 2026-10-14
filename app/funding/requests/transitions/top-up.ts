@@ -4,22 +4,20 @@
 
 import type { FailureStep, PaymentState } from "@getsome/core";
 import {
-  advanceFundingProgressSnapshot,
-  fundingProgressSignalForSharedStep,
-  progressProviderForSource,
-  type FundingProgressSignal,
-} from "../../progress";
-import {
   CONVERTING_STEP_ORDER,
   DEPOSIT_EXPIRED_REASON,
+  FUNDING_HELD_REASON,
   PROVISIONAL_REVERT_MS,
   buyerPaid,
+  directDepositGate,
   paymentWatchUntil,
-  effectiveSourceId,
   isConvertingStep,
+  isDirectDeposit,
   isTerminal,
   rankOf,
+  seenOnBurner,
   type ConvertingStep,
+  type DepositMismatchState,
   type DepositSeenVia,
   type Observation,
   type RailState,
@@ -28,6 +26,14 @@ import {
   type RequestStatus,
   type WorkerJobView,
 } from "../model";
+import {
+  burnerFinal,
+  burnerSighted,
+  burnerSightingRetracted,
+  chainflipObserved,
+  statusObserved,
+  workerObserved,
+} from "../facts";
 import { mergeRail, railFromSwapStatus, stageRank } from "../rail";
 
 type Witnesses = TopUpRecord["witnesses"];
@@ -35,16 +41,12 @@ type Assurance = Extract<RequestStatus, { kind: "deposit-seen" }>["assurance"];
 type ChainObservation = Extract<Observation, { source: "chain"; burnerNative: string }>;
 type UserObservation = Extract<Observation, { source: "user" }>;
 type ProviderResult = Extract<Observation, { source: "provider"; result: unknown }>;
-/** The fields a positive money observation clears from a record it resurrects. */
-type ClearedField = "cancelledAt" | "failureReason" | "refunded" | "failure";
+/** The fields a positive money observation clears from a record it resurrects, the mismatch a
+ *  Polkadot deposit drops once it is settled one way or the other, and the early claim word a
+ *  retry drops. */
+type ClearedField =
+  "cancelledAt" | "failureReason" | "refunded" | "failure" | "depositMismatch" | "creditedAt";
 
-const FAILED: FundingProgressSignal = { observation: { kind: "failed" } };
-const SETTLED: FundingProgressSignal = { observation: { kind: "settled" } };
-const HOLD: FundingProgressSignal = { observation: { kind: "hold" } };
-const ROUTE_COMPLETE: FundingProgressSignal = {
-  observation: { kind: "route-complete" },
-  routeStatus: "complete",
-};
 const EXPIRED_FAILURE: RequestFailure = {
   kind: "expired",
   step: "deposit",
@@ -72,6 +74,8 @@ function apply(record: TopUpRecord, observation: Observation): TopUpRecord {
       if ("gone" in observation) {
         return applyProviderGone(record, observation.at, observation.message);
       }
+      // A sale's order belongs to a withdrawal.
+      if ("sale" in observation) return record;
       return applyProviderUnreachable(record, observation.at);
     case "chain":
       return "burnerNative" in observation ? applyChain(record, observation) : record;
@@ -96,11 +100,6 @@ function settledOnly(record: TopUpRecord, next: TopUpRecord): TopUpRecord {
       : {}),
     ...(next.confirmedAt === undefined ? {} : { confirmedAt: next.confirmedAt }),
   };
-}
-
-function advanced(record: TopUpRecord, signal: FundingProgressSignal, at: number): TopUpRecord {
-  const progress = advanceFundingProgressSnapshot(record.progress, { ...signal, at });
-  return progress === record.progress ? record : { ...record, progress };
 }
 
 function witnessed(record: TopUpRecord, patch: Partial<Witnesses>): TopUpRecord {
@@ -130,9 +129,8 @@ const atSideExit = (record: TopUpRecord): boolean =>
 
 /** A positive money observation: moves a rank-0 record (or a side exit left from rank 0) to
  *  deposit-seen, and firms up a provisional sighting. Never touches a record past rank 1. Money
- *  on the burner itself (the worker, the faucet, a chain read, the pre-cancel read) completes the
- *  payment leg; the conversion stage waits for the worker's swap report. A sighting on the
- *  provider's side holds, and the branch's own route observation carries the stage. */
+ *  on the burner itself (the worker, a chain read, the pre-cancel read) is also recorded as the
+ *  burner sighting. */
 function moneySeen(
   record: TopUpRecord,
   at: number,
@@ -150,52 +148,29 @@ function moneySeen(
     status: { kind: "deposit-seen", at, assurance, via },
     funded: earliest(record.funded, at),
   };
-  const onBurner = via !== "core" && via !== "rail";
-  return advanced(seen, onBurner ? ROUTE_COMPLETE : HOLD, at);
+  return seenOnBurner(via) ? burnerSighted(seen, at) : seen;
 }
 
 function failed(record: TopUpRecord, at: number, failure: RequestFailure): TopUpRecord {
   const status: RequestStatus = { kind: "failed", at, recoverable: failure.recoverable };
-  return advanced({ ...record, status, failure, failureReason: failure.message }, FAILED, at);
+  return { ...record, status, failure, failureReason: failure.message };
 }
 
 function expired(record: TopUpRecord, at: number): TopUpRecord {
   const status: RequestStatus = { kind: "expired", at };
-  return advanced(
-    { ...record, status, failure: EXPIRED_FAILURE, failureReason: DEPOSIT_EXPIRED_REASON },
-    FAILED,
-    at,
-  );
+  return { ...record, status, failure: EXPIRED_FAILURE, failureReason: DEPOSIT_EXPIRED_REASON };
 }
 
 function settled(record: TopUpRecord, at: number): TopUpRecord {
-  return advanced({ ...record, status: { kind: "settled", at }, settledAt: at }, SETTLED, at);
-}
-
-/** The conversion started no later than the step that follows it: a record whose first worker
- *  report is already past the swap still gets the stage stamped, at that report's instant. */
-function conversionStarted(record: TopUpRecord, at: number): TopUpRecord {
-  return record.progress.stageTimestamps["cash-conversion"] === undefined
-    ? advanced(record, fundingProgressSignalForSharedStep("swap"), at)
-    : record;
+  return { ...record, status: { kind: "settled", at }, settledAt: at };
 }
 
 function claiming(record: TopUpRecord, at: number): TopUpRecord {
-  const status: RequestStatus = { kind: "claiming", at };
-  return advanced(
-    conversionStarted({ ...record, status }, at),
-    fundingProgressSignalForSharedStep("done"),
-    at,
-  );
+  return { ...record, status: { kind: "claiming", at } };
 }
 
 function converting(record: TopUpRecord, at: number, step: ConvertingStep): TopUpRecord {
-  const status: RequestStatus = { kind: "converting", at, step };
-  return advanced(
-    conversionStarted({ ...record, status }, at),
-    fundingProgressSignalForSharedStep(step),
-    at,
-  );
+  return { ...record, status: { kind: "converting", at, step } };
 }
 
 function sameDeposit(
@@ -241,24 +216,19 @@ function applyCoreState(record: TopUpRecord, at: number, state: PaymentState): T
       };
     }
     case "swapping": {
-      let seen = next;
+      let seen = chainflipObserved(next, state, at);
       // Core's view of the rail counts only while no provider poll has reported.
       if (seen.witnesses.provider === undefined) {
         const rail = mergeRail(
           seen.rail,
           railFromSwapStatus(seen.rail.provider, { status: state.swap }, at),
         );
-        seen = { ...seen, rail };
+        seen = statusObserved({ ...seen, rail }, state.swap, at);
         if (rail.stage !== "failed" && stageRank(rail.stage) >= stageRank("received")) {
           seen = moneySeen(seen, at, "provisional", "core");
         }
       }
-      const provider = progressProviderForSource(effectiveSourceId(record.ref));
-      return advanced(
-        seen,
-        { observation: provider.observeRoute(state.swap), routeStatus: state.swap },
-        at,
-      );
+      return seen;
     }
     case "funded":
     case "working":
@@ -310,9 +280,13 @@ function workerWitness(job: WorkerJobView, at: number): Witnesses["worker"] {
     fundsSeenAt: job.fundsSeenAt,
     lastTickAt: job.lastTickAt,
     at,
+    ...(job.workedMs === undefined ? {} : { workedMs: job.workedMs }),
+    ...(job.claim?.workedMs === undefined ? {} : { claimWorkedMs: job.claim.workedMs }),
     ...(job.failure === undefined ? {} : { failure: job.failure }),
     ...(job.claim === null ? {} : { claimPhase: job.claim.phase }),
     ...(job.claim?.status === undefined ? {} : { claimStatus: job.claim.status }),
+    ...(job.claim?.credited === undefined ? {} : { claimCredited: job.claim.credited }),
+    ...(job.psmRefusals === undefined ? {} : { psmRefusals: job.psmRefusals }),
     ...(job.txs === undefined ? {} : { txs: job.txs }),
   };
 }
@@ -320,12 +294,24 @@ function workerWitness(job: WorkerJobView, at: number): Witnesses["worker"] {
 function applyWorker(record: TopUpRecord, at: number, job: WorkerJobView | null): TopUpRecord {
   if (job === null) return witnessed(record, { worker: { known: false, at } });
   const witnessAt = Math.max(at, job.lastTickAt ?? 0, job.claim?.at ?? 0);
-  let next: TopUpRecord = {
-    ...witnessed(record, { worker: workerWitness(job, witnessAt) }),
-    confirmedAt: at,
-  };
+  let next: TopUpRecord = workerObserved(
+    { ...witnessed(record, { worker: workerWitness(job, witnessAt) }), confirmedAt: at },
+    job,
+    at,
+  );
   // A job that saw funds is a money observation whatever its phase says (3.2, rule 3).
   if (job.fundsSeenAt !== null) next = moneySeen(next, job.fundsSeenAt, "finalized", "worker");
+  // The host's early word: every mint is in a block. Kept through a reorg or a further attempt;
+  // only a retry after a failure drops it.
+  const { claim } = job;
+  if (
+    job.phase !== "failed" &&
+    claim?.phase === "claiming" &&
+    claim.status === "claimed" &&
+    next.creditedAt === undefined
+  ) {
+    next = { ...next, creditedAt: claim.at };
+  }
   const rank = rankOf(next);
   if (job.claim?.phase === "claimed") {
     const claimed = claimedAmount(job.claim.amount ?? job.claim.credited);
@@ -355,6 +341,17 @@ function applyWorker(record: TopUpRecord, at: number, job: WorkerJobView | null)
         recoverable: true,
       });
     }
+    if (job.failure === "held" && rank >= 1) {
+      // The PSM refused the mint three times over and the worker stopped with the deposit still
+      // on the burner: recoverable, since a re-sent hand-off re-arms the
+      // job with a fresh refusal count. The buyer reads the app's own words, not the chain's.
+      return failed(next, at, {
+        kind: "mint",
+        step: rank >= 3 ? "mint" : "swap",
+        message: FUNDING_HELD_REASON,
+        recoverable: true,
+      });
+    }
     if (job.failure === "expired" && rank === 0 && !buyerPaid(next)) {
       return expired(next, at);
     }
@@ -379,17 +376,12 @@ function applyProviderResult(record: TopUpRecord, observation: ProviderResult): 
     record.rail,
     railFromSwapStatus(record.rail.provider, result, at, observation.delayed),
   );
-  let next = witnessed(rail === record.rail ? record : { ...record, rail }, {
-    provider: { status: result.status, at },
-  });
-  if (rail.stage !== record.rail.stage || rail.status !== record.rail.status) {
-    const provider = progressProviderForSource(effectiveSourceId(record.ref));
-    next = advanced(
-      next,
-      { observation: provider.observeRoute(result.status), routeStatus: result.status },
-      at,
-    );
-  }
+  const railed = statusObserved(
+    rail === record.rail ? record : { ...record, rail },
+    result.status,
+    at,
+  );
+  let next = witnessed(railed, { provider: { status: result.status, at } });
   if (rail.stage !== "failed" && stageRank(rail.stage) >= stageRank("received")) {
     // The rail reports the buyer paid; a payment reported after the window closed re-opens the
     // request.
@@ -451,21 +443,41 @@ const workerSawFunds = (record: TopUpRecord): boolean => {
   return worker !== undefined && worker.known && worker.fundsSeenAt !== null;
 };
 
+/** The app's read of money on the burner: a money observation, and whatever the status, the
+ *  burner sighting and, when the read was final, the deposit final there. */
+function moneyOnBurner(record: TopUpRecord, { at, finality, via }: ChainObservation): TopUpRecord {
+  const final = finality === "finalized";
+  const seen = moneySeen(
+    record,
+    at,
+    final ? "finalized" : "provisional",
+    via === "probe" ? "chain" : via,
+  );
+  const sighted = burnerSighted(seen, at);
+  return final ? burnerFinal(sighted, at) : sighted;
+}
+
 function applyChain(record: TopUpRecord, observation: ChainObservation): TopUpRecord {
-  const { at, burnerNative, finality, block, via } = observation;
+  const { at, burnerNative, finality, block } = observation;
   const reading = { burnerNative, ...(block === undefined ? {} : { block }), at };
   const next: TopUpRecord = {
     ...witnessed(record, { chain: { ...record.witnesses.chain, [finality]: reading } }),
     confirmedAt: at,
   };
+  if (isDirectDeposit(next) && next.deposit !== undefined) {
+    if (next.status.kind === "awaiting-deposit") return applyDirectReading(next, observation);
+    // An ended one is not brought back by a balance short of the gate: the worker would not
+    // convert it, and the journey offers the way to take it back.
+    const ended = next.status.kind === "expired" || next.status.kind === "cancelled";
+    if (ended && BigInt(burnerNative) < directDepositGate(next)) return next;
+  }
   if (BigInt(burnerNative) > 0n) {
     if (next.status.kind === "settled") {
       return witnessed(next, {
         conflict: { source: "chain", note: "funds on a settled burner", at },
       });
     }
-    const assurance: Assurance = finality === "finalized" ? "finalized" : "provisional";
-    return moneySeen(next, at, assurance, via === "probe" ? "chain" : via);
+    return moneyOnBurner(next, observation);
   }
   // A zero read is never a money observation; a finalized one can only unwind a chain-provisional
   // sighting that nothing else has confirmed within the revert window.
@@ -478,9 +490,38 @@ function applyChain(record: TopUpRecord, observation: ChainObservation): TopUpRe
     at - status.at > PROVISIONAL_REVERT_MS &&
     !workerSawFunds(next)
   ) {
-    return { ...next, status: { kind: "awaiting-deposit" } };
+    return burnerSightingRetracted({ ...next, status: { kind: "awaiting-deposit" } });
   }
   return next;
+}
+
+/**
+ * A reading of a Polkadot deposit's account while the request waits. The buyer sends it from any
+ * wallet, so nothing but the amount says whether it is the deposit: the request moves on once the
+ * picked token reaches what the worker converts at, and not before. A balance in another token
+ * is recorded first, since that is the one the buyer has to act on; less of the picked token is
+ * recorded when there is nothing else. A reading from the deposit watch that finds nothing at
+ * all clears a mismatch, since the buyer took the funds back; any other reading leaves it.
+ */
+function applyDirectReading(record: TopUpRecord, observation: ChainObservation): TopUpRecord {
+  const { at, burnerNative, stray } = observation;
+  const held = BigInt(burnerNative);
+  if (held > 0n && held >= directDepositGate(record)) {
+    return without(moneyOnBurner(record, observation), ["depositMismatch"]);
+  }
+  const found: Omit<DepositMismatchState, "at"> | null =
+    stray && BigInt(stray.amount) > 0n
+      ? { kind: "token", asset: stray.asset, amount: stray.amount }
+      : held > 0n
+        ? { kind: "short", asset: record.deposit!.assetSymbol, amount: held.toString() }
+        : null;
+  if (found === null) return stray === undefined ? record : without(record, ["depositMismatch"]);
+  const current = record.depositMismatch;
+  const same =
+    current?.kind === found.kind &&
+    current.asset === found.asset &&
+    current.amount === found.amount;
+  return same ? record : { ...record, depositMismatch: { ...found, at } };
 }
 
 function applyClock(record: TopUpRecord, at: number): TopUpRecord {
@@ -530,14 +571,33 @@ function applyUser(record: TopUpRecord, observation: UserObservation): TopUpReco
         record.failure?.step === "mint"
           ? { kind: "claiming", at }
           : { kind: "converting", at, step };
-      return advanced({ ...without(record, ["failure", "failureReason"]), status }, HOLD, at);
+      return { ...without(record, ["failure", "failureReason", "creditedAt"]), status };
     }
     case "meld-submitted":
       return record.meldSubmittedAt === undefined ? { ...record, meldSubmittedAt: at } : record;
     case "deposit-skipped":
       return record.depositSkippedAt === undefined ? { ...record, depositSkippedAt: at } : record;
+    case "deposit-accepted": {
+      // Only a request still on its deposit takes new terms; one that has moved on keeps its own.
+      if (record.status.kind !== "awaiting-deposit" || record.deposit === undefined) return record;
+      const { terms } = observation;
+      return without(
+        {
+          ...record,
+          amountHuman: terms.amountHuman,
+          asset: terms.asset,
+          sourceAmount: terms.deposit.formatted,
+          sourceSymbol: terms.deposit.assetSymbol,
+          deposit: { ...record.deposit, ...terms.deposit },
+          conversion: terms.conversion,
+          handoff: terms.handoff,
+        },
+        ["depositMismatch"],
+      );
+    }
     case "payment-requested":
     case "channel-opened":
+    case "sale-unfundable":
       return record;
   }
 }

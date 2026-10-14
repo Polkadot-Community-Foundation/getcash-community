@@ -4,6 +4,7 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import { FUNDING_CHAINS, sourceIdFor } from "~~/lib/config";
+import type { DepositMismatch } from "../funding/deposit-mismatch";
 import { useOffersStore } from "./offers";
 import { useRequestsStore } from "./requests";
 import { useSessionStore } from "./session";
@@ -22,12 +23,12 @@ const JOURNEY_PHASES = new Set([
 export type Step = "amount" | "method" | "network" | "token";
 
 /**
- * A drill-in a demo preview scene asked the Meld route to open over its screen.
+ * A drill-in a demo preview scene asked a route to open over its screen.
  *
  * The drill-ins are the route's own refs, so a scene has no way into them: this is the one door,
  * read behind `isDemoBuild()` and null in every build that is not the deck's.
  */
-export type PreviewDrillIn = "currency" | "fees";
+export type PreviewDrillIn = "currency" | "fees" | "refund";
 
 export const useFlowStore = defineStore("flow", () => {
   const session = useSessionStore();
@@ -43,6 +44,10 @@ export const useFlowStore = defineStore("flow", () => {
   const confirmingCancel = ref(false);
   /** Demo deck only: the drill-in a scene wants open. See `PreviewDrillIn`. */
   const previewDrillIn = ref<PreviewDrillIn | null>(null);
+  /** Demo deck only: the deposit mismatch a scene wants the sheet to show over the deposit. */
+  const previewMismatch = ref<DepositMismatch | null>(null);
+  /** The recovery screen for a mismatched direct deposit has taken the deposit screen. */
+  const recoveringDeposit = ref(false);
 
   const srcChain = computed(() => FUNDING_CHAINS[srcChainIndex.value] ?? FUNDING_CHAINS[0]);
   const srcAsset = computed(
@@ -61,17 +66,33 @@ export const useFlowStore = defineStore("flow", () => {
     srcAssetIndex.value = a;
   }
 
+  /** The catalog position of a pair, or null when the catalog lacks it. */
+  function positionOf(chain: string, asset: string): { c: number; a: number } | null {
+    const c = FUNDING_CHAINS.findIndex((entry) => entry.chain === chain);
+    if (c < 0) return null;
+    const a = (FUNDING_CHAINS[c]!.assets as readonly string[]).indexOf(asset);
+    return a < 0 ? null : { c, a };
+  }
+
+  /** Points the pickers at a pair by name without quoting. False when the catalog lacks it. */
+  function setSourceByName(chain: string, asset: string): boolean {
+    const position = positionOf(chain, asset);
+    if (position === null) return false;
+    setSource(position.c, position.a);
+    return true;
+  }
+
   /** Picks network and token in one move, with a single re-quote. */
   function selectSource(chain: string, asset: string) {
-    const c = FUNDING_CHAINS.findIndex((entry) => entry.chain === chain);
-    if (c < 0) return;
-    const a = (FUNDING_CHAINS[c]!.assets as readonly string[]).indexOf(asset);
-    if (a < 0) return;
+    const position = positionOf(chain, asset);
+    if (position === null) return;
     // Re-quote unless the pickers already point here and the quote on hand is for this source.
     const quotedHere =
       session.quoted?.sourceChain === chain && session.quoted?.sourceAsset === asset;
-    if (c === srcChainIndex.value && a === srcAssetIndex.value && quotedHere) return;
-    setSource(c, a);
+    if (position.c === srcChainIndex.value && position.a === srcAssetIndex.value && quotedHere) {
+      return;
+    }
+    setSource(position.c, position.a);
     void session.fetchQuote(srcChain.value.chain, srcAsset.value);
   }
 
@@ -138,6 +159,8 @@ export const useFlowStore = defineStore("flow", () => {
   function resetEntry() {
     step.value = "amount";
     confirmingCancel.value = false;
+    previewMismatch.value = null;
+    recoveringDeposit.value = false;
   }
 
   function startOver() {
@@ -155,7 +178,10 @@ export const useFlowStore = defineStore("flow", () => {
     starting,
     confirmingCancel,
     previewDrillIn,
+    previewMismatch,
+    recoveringDeposit,
     screen,
+    setSourceByName,
     selectSource,
     startPurchase,
     pickNetwork,

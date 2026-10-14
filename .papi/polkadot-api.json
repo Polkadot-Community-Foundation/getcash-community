@@ -6,13 +6,13 @@
       "wsUrl": "wss://asset-hub-paseo-rpc.n.dwellir.com",
       "metadata": ".papi/metadata/paseo_next_v2.scale",
       "genesis": "0xd6eec26135305a8ad257a20d003357284c8aa03d0bdb2b357ab0a22371e11ef2",
-      "codeHash": "0x3d399dc2daeaaf831fc4fda6ddc1958494fc0f3319ebb8ec0c1e7ca8995eed56"
+      "codeHash": "0xd85bfdb17cf421d6a75c9db9ba16cd713a840e42a02ca69becff7e3570b8debb"
     },
     "paseo_people_next": {
       "wsUrl": "wss://people-paseo.rotko.net",
       "metadata": ".papi/metadata/paseo_people_next.scale",
       "genesis": "0xe6c30d6e148f250b887105237bcaa5cb9f16dd203bf7b5b9d4f1da7387cb86ec",
-      "codeHash": "0xd0f3191c63f51decc9eaa0cb61be5e84dcda532e0934e827d382183458ac36df"
+      "codeHash": "0x35364c0ac81591deb3c5fd02813a077464cd362d3a0ca22d5f79c8cc8773387d"
     }
   }
 }

@@ -18,11 +18,6 @@ const SUGGESTED_GAS: Partial<Record<RefundChain, string>> = {
   Tron: "15 TRX",
 };
 
-/** A failure whose funds come back to the request's own refund key. */
-export function refundedFailure(kind: string): boolean {
-  return kind === "refunded" || kind === "refund-failed";
-}
-
 export interface RecoveryNotes {
   secretLabel: string;
   /** Step-one gas note for a refunded token; null when the refund is the chain's own coin. */
@@ -50,6 +45,23 @@ export function recoveryNotes(
           `you can buy it on any exchange.`,
     importNote: `Import this key into any wallet that supports ${chain}.`,
     transferNote: `Transfer your ${asset} to any ${chain} address you control`,
+  };
+}
+
+/** The same notes for a Polkadot deposit still on the top-up's own account, whose key is the
+ *  account's raw seed. Asset Hub can charge a token's fee in the token itself, so DOT is only a
+ *  fallback there. */
+export function directRecoveryNotes(asset: string): RecoveryNotes {
+  return {
+    secretLabel: "Raw seed",
+    gasNote:
+      asset === "DOT"
+        ? null
+        : `Moving ${asset} on Polkadot needs a small fee. Pay it in ${asset} if your wallet ` +
+          `offers that, or send a little DOT to this address first.`,
+    importNote:
+      "Import this key as a raw seed into a Polkadot wallet, such as Talisman, SubWallet or the Polkadot.js extension.",
+    transferNote: `Transfer your ${asset} to any Polkadot address you control`,
   };
 }
 

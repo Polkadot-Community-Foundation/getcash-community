@@ -1,0 +1,16 @@
+{
+  "testnet": true,
+  "nativeSymbol": "PAS",
+  "assetHub": {
+    "paraId": 1000,
+    "genesis": "0xd6eec26135305a8ad257a20d003357284c8aa03d0bdb2b357ab0a22371e11ef2",
+    "rpc": "wss://asset-hub-paseo-rpc.n.dwellir.com",
+    "cashAssetId": 50000413
+  },
+  "people": {
+    "paraId": 1004,
+    "genesis": "0xe6c30d6e148f250b887105237bcaa5cb9f16dd203bf7b5b9d4f1da7387cb86ec",
+    "rpc": "wss://people-paseo.rotko.net",
+    "poolAccount": "5EhshnzMBCqA3YFqprQziESXAi5NDbHzRcU1frTsMVKdfMcq"
+  }
+}
