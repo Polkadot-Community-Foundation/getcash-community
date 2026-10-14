@@ -7,6 +7,7 @@ export {
   DIRECT_SLIPPAGE_PCT,
   FundingHeldError,
   FundingShortfallError,
+  MAX_PROGRAM_REJECTIONS,
   MAX_PSM_REFUSALS,
   discoverPool,
   discoverPools,
@@ -17,12 +18,13 @@ export {
   quoteStableForUnderlying,
   quoteStableIn,
   quoteUnderlyingOut,
+  readDeposit,
   sizeNativeBudget,
   stableDepositNeeded,
   tickOnce,
   withHeadroom,
 } from "./pipeline";
-export type { FundingStep, TickState } from "./pipeline";
+export type { ConversionFact, FundingStep, TickState } from "./pipeline";
 export {
   buildFundingProgram,
   buildPsmFundingProgram,
