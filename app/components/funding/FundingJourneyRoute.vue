@@ -5,13 +5,14 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useStateDirector } from "../../composables/useStateDirector";
 import { useVisibilityReconcile } from "../../composables/useVisibilityReconcile";
-import type { FundingJourneyStatus } from "../../funding/handoff";
 import type { FundingTopUp } from "../../funding/top-ups";
 import { useFlowStore } from "../../stores/flow";
 import { useRequestsStore } from "../../stores/requests";
 import { useSessionStore } from "../../stores/session";
+import { isDemoBuild } from "../../utils/demo";
 import CancelTopUpScreen from "../screens/CancelTopUpScreen.vue";
 import JourneySkeleton from "../screens/JourneySkeleton.vue";
+import RecoverDepositScreen from "../screens/RecoverDepositScreen.vue";
 import ReturnFundsScreen from "../screens/ReturnFundsScreen.vue";
 import FundingSettledStatusScreen from "./FundingSettledStatusScreen.vue";
 import { useJourneyQuote } from "../../composables/useJourneyQuote";
@@ -19,12 +20,11 @@ import MeldFeeDetailsScreen from "./routes/MeldFeeDetailsScreen.vue";
 
 const props = defineProps<{
   title: string;
-  /** The top-up as the list knows it; null after a handoff. Its stored progress is the fallback
+  /** The top-up as the list knows it; null after a handoff. Its stored timeline is the fallback
    *  while the request is not live in the store. */
   topUp?: FundingTopUp | null;
   /** Brings `topUp` to the foreground; null after a handoff. */
   open?: ((topUp: FundingTopUp) => Promise<boolean>) | null;
-  status?: FundingJourneyStatus | null;
 }>();
 // startOver bubbles up from a fiat top-up that ended: the host re-enters its package with the same
 // amount.
@@ -74,14 +74,19 @@ watch(
     if (phase !== null && phase !== "failed") showingRefund.value = false;
   },
 );
-// The preview deck lands straight on the opened guide.
-watch(
-  () => session.revealRefund,
-  (want) => {
-    if (want) showingRefund.value = true;
-  },
-  { immediate: true },
-);
+/** The recovery guide over an ended Polkadot top-up, whose funds, if any, are on its own
+ *  account. */
+const showingRecovery = ref(false);
+// Demo deck: a scene can land straight on the opened guide. Inert everywhere else.
+if (isDemoBuild()) {
+  watch(
+    () => flow.previewDrillIn,
+    (want) => {
+      if (want === "refund") showingRefund.value = true;
+    },
+    { immediate: true },
+  );
+}
 
 // The cancel confirmation over the journey, asked for by the bank transfer's Cancel. It is the
 // flow store's flag, as the crypto deposit's confirmation is: one place holds "a cancel is being
@@ -98,6 +103,7 @@ watch(
 function goBack() {
   if (flow.confirmingCancel) flow.confirmingCancel = false;
   else if (showingRefund.value) showingRefund.value = false;
+  else if (showingRecovery.value) showingRecovery.value = false;
   else if (showingFees.value) showingFees.value = false;
   else emit("back");
 }
@@ -179,6 +185,7 @@ onUnmounted(() => {
         @keep="flow.confirmingCancel = false"
       />
       <ReturnFundsScreen v-else-if="showingRefund" :top-up="topUp" @back="showingRefund = false" />
+      <RecoverDepositScreen v-else-if="showingRecovery" @back="showingRecovery = false" />
       <MeldFeeDetailsScreen
         v-else-if="showingFees"
         :quote="quote"
@@ -187,11 +194,10 @@ onUnmounted(() => {
       />
       <template v-else>
         <JourneyScreen
-          :progress="topUp?.progress ?? null"
-          :status="status ?? null"
           :top-up="topUp ?? null"
           @fees="showingFees = true"
           @refund="showingRefund = true"
+          @recover="showingRecovery = true"
           @cancel="flow.confirmingCancel = true"
           @close="emit('back')"
           @start-over="emit('startOver')"

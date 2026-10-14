@@ -9,6 +9,7 @@ import { getWsProvider } from "polkadot-api/ws";
 import { paseo_next_v2, paseo_people_next } from "@polkadot-api/descriptors";
 import {
   buildFundingProgram,
+  chooseCashTransfer,
   destinationEarmark,
   discoverPool,
   dryRunFundingProgram,
@@ -28,13 +29,20 @@ const fmtPas = (v: bigint) => (Number(v) / 1e10).toFixed(6);
 
 describe.runIf(process.env.VERIFY_AMOUNTS === "1")("live amount check", () => {
   it("ask for 20 / 50 / 100 CASH -> what lands", async () => {
-    const ahC = createClient(getWsProvider("wss://asset-hub-paseo-rpc.n.dwellir.com"));
-    const peC = createClient(getWsProvider("wss://people-paseo.rotko.net"));
+    const ahC = createClient(getWsProvider("wss://paseo-asset-hub-next-rpc.polkadot.io"));
+    const peC = createClient(getWsProvider("wss://paseo-people-next-system-rpc.polkadot.io"));
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ah: any = ahC.getTypedApi(paseo_next_v2);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const pe: any = peC.getTypedApi(paseo_people_next);
     try {
+      const transfer = await chooseCashTransfer({
+        assetHub: ahC,
+        people: peC,
+        assetHubParaId: PASEO_ASSET_HUB_PARA_ID,
+        peopleParaId: PASEO_PEOPLE_PARA_ID,
+      });
+      console.log(`CASH moves to People by ${transfer}`);
       // Dry-run from the richest native holder, so the whole program can be simulated whatever
       // the deposit size.
       const accounts = (await ah.query.System.Account.getEntries()) as Array<{
@@ -79,6 +87,7 @@ describe.runIf(process.env.VERIFY_AMOUNTS === "1")("live amount check", () => {
             nativeBalance: deposit,
             minUnderlyingOut: buyTarget,
             remoteFeesCash: earmark,
+            transfer,
             feeProbeAddress: from,
             dryRunFrom: from,
           });
@@ -90,6 +99,7 @@ describe.runIf(process.env.VERIFY_AMOUNTS === "1")("live amount check", () => {
             remoteFeesCash: earmark,
             beneficiaryHex: ZERO_32,
             peopleParaId: PASEO_PEOPLE_PARA_ID,
+            transfer,
             maxWeight: fees.maxWeight,
           });
           // The worker's gate: both chains run the program, and it throws on a failure, a trap or

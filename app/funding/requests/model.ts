@@ -2,6 +2,7 @@
 // that move it, and the constants the store and the reducer share.
 
 import type {
+  ChainflipProgressFacts,
   FailureKind,
   FailureStep,
   PaymentPhase,
@@ -10,11 +11,16 @@ import type {
   SwapProgress,
   SwapStatusResult,
 } from "@getsome/core";
-import type { FundingStep } from "@getsome/funding";
+import {
+  DIRECT_SLIPPAGE_PCT,
+  recordedRoute,
+  type ConversionRoute,
+  type FundingStep,
+  type Stable,
+} from "@getsome/funding";
 import type { WithdrawStep } from "@getsome/withdraw";
 import type { RequestRef } from "../../utils/request-index";
-import type { FundingProgressSnapshot } from "../progress";
-import { CRYPTO_SOURCE_ID, isMeldSourceId, meldMethodFor } from "../source-ids";
+import { CRYPTO_SOURCE_ID, isDirectSourceId, isMeldSourceId, meldMethodFor } from "../source-ids";
 
 /** Trailing debounce per key for non-critical host writes. */
 export const COALESCE_MS = 250;
@@ -24,8 +30,12 @@ export const CONFIRMED_TTL_MS = 60_000;
 export const HIDDEN_RESET_MS = 5_000;
 /** Worker job blob poll while visible and any record is at rank 0–3. */
 export const JOB_POLL_MS = 6_000;
+/** The same poll while a top-up's claim is in flight and the host's word on it is due. */
+export const JOB_POLL_CLAIMING_MS = 1_000;
 /** Foreground Meld status poll. */
 export const MELD_POLL_MS = 3_000;
+/** The Meld poll's ceiling while its reads keep failing; the delay doubles up to it. */
+export const MELD_POLL_MAX_MS = 30_000;
 /** Foreground host payment status poll, while a withdrawal awaits its payment. */
 export const PAYMENT_POLL_MS = 3_000;
 /** A job whose `lastTickAt` is older than this counts as stale. */
@@ -59,8 +69,20 @@ export const PROBED_RECHECK_MS = 86_400_000;
 export const PROVISIONAL_REVERT_MS = 600_000;
 /** Failure reason for a request whose deposit window lapsed. */
 export const DEPOSIT_EXPIRED_REASON = "Channel expired";
+/** The worker holds a request after the PSM refused the mint three times: the deposit stays on
+ *  the request's own address and a retry re-runs the mint. */
+export const FUNDING_HELD_REASON =
+  "CASH can't be minted right now. Your funds are safe at this request's deposit address; try again later.";
 /** Window for the purse's payment to reach a withdrawal's key before the request expires. */
 export const PAYMENT_WINDOW_MS = 1_800_000;
+/** How long a fiat sale waits for its purse to be asked, through the seller's KYC and after the
+ *  provider names its deposit address, when the adapter names no expiry of its own. The payment
+ *  window starts when the purse is asked. */
+export const SALE_WINDOW_MS = 86_400_000;
+/** How long after its purse is asked a fiat sale's key may still pay the provider. Meld names no
+ *  expiry for a SELL order, so the sale carries its own on the channel: past it the worker sends
+ *  the key home rather than pay an order the provider may have dropped. */
+export const SALE_PAY_WINDOW_MS = 3_600_000;
 /** Failure reason for a withdrawal whose payment never reached its key. */
 export const PAYMENT_EXPIRED_REASON = "Payment not received";
 
@@ -70,10 +92,12 @@ export type Kind = "top-up" | "withdrawal";
  *  still within its TTL, waiting on a running reconcile, or the cache as it was left. */
 export type Freshness = "confirmed" | "reconciling" | "cached";
 /** The pipeline's steps between the deposit and the claim, derived from `FundingStep`: `swap` is
- *  the one program that swaps and teleports together, `await-arrival` waits for the teleported
- *  $CASH to be credited on People. */
+ *  the one program that swaps and sends together, `await-arrival` waits for the CASH sent to be
+ *  credited on People. */
 export type ConvertingStep = Exclude<FundingStep, "await-native" | "done">;
-export type DepositSeenVia = "worker" | "chain" | "rail" | "core" | "faucet" | "pre-cancel";
+export type DepositSeenVia = "worker" | "chain" | "rail" | "core" | "pre-cancel";
+/** A sighting of the money on the burner itself; core and the rail only relay the provider's. */
+export const seenOnBurner = (via: DepositSeenVia): boolean => via !== "core" && via !== "rail";
 /** The worker's claim as it moves: sized, registered with the host, claiming, claimed. */
 export type WorkerClaimPhase = "sizing" | "registering" | "claiming" | "claimed";
 
@@ -120,6 +144,36 @@ export interface RequestFailure {
   recoverable: boolean;
   refunded?: boolean;
   refund?: RefundProgress;
+  /** The rail's own code for the ending, when it named one. */
+  code?: string;
+}
+
+/** A direct deposit that is not the one asked: less of the picked token, or a balance in another
+ *  of the direct tokens. `asset` is the token's symbol as the deposit screen names it and
+ *  `amount` its base units. */
+export interface DepositMismatchState {
+  kind: "short" | "token";
+  asset: string;
+  amount: string;
+  at: number;
+}
+
+/** What a request becomes when the buyer continues with a mismatched deposit: the CASH that
+ *  arrived converts to, the token and amount that arrived as its new deposit, and the route and
+ *  hand-off that convert it. */
+export interface AcceptedDepositTerms {
+  amountHuman: string;
+  asset: string;
+  deposit: { amount: string; formatted: string; assetSymbol: string };
+  conversion: ConversionRoute;
+  handoff: WorkerHandoffPayload;
+}
+
+/** A balance in one of the direct tokens the request did not pick, as the deposit watch reads
+ *  it. */
+export interface StrayDeposit {
+  asset: string;
+  amount: string;
 }
 
 /** The object `runFundingViaWorker` sends today, verbatim. */
@@ -133,7 +187,63 @@ export interface WorkerHandoffPayload {
   assetHubGenesis: string;
   peopleGenesis: string;
   remoteFeeBuffer: string;
+  /** Native pool tier only; "0" on the stable tiers, which price their own fees live. */
   keepNativeForFees: string;
+  /** The conversion tier decided at quote time and frozen here; the worker consumes it and never
+   *  re-decides. A payload from before tiers were recorded is a pool one. */
+  tier: ConversionRoute["tier"];
+  /** The stable the buyer deposits: the PSM's external on the psm tier, the stable a pool job is
+   *  fed with, absent for a native deposit. `feeRate` is the psm tier's, the Permill read at
+   *  quote time that the call's `max_fee` repeats. */
+  external?: Stable;
+  feeRate?: number;
+  /** With a stable tier: the stable the buyer was asked to deposit, as the quote sized it. The
+   *  worker's gate checks for this rather than re-pricing the fees, which would move the bar under
+   *  a deposit already sized against it. Absent on a payload from before it was recorded. */
+  quotedDeposit?: string;
+}
+
+/** A fact the top-up timeline measures time from that has no time of its own on the record: a
+ *  provider status, the deposit first seen on the burner itself (kept once the status moves on),
+ *  the deposit first read final on the burner by the app, the CASH final on People (the worker's
+ *  funding leg done), and the host's `claiming`. */
+export type ObservedFact =
+  | Exclude<SwapProgress, "waiting">
+  | "on-burner"
+  | "final-on-burner"
+  | "cash-on-people"
+  | "host-claiming";
+
+/** Chainflip's progress as the record keeps it: no count or time moves back, and a fact a later
+ *  read leaves out stays. Chainflip's clock is a witness, not a fact. */
+export interface ChainflipFacts extends Omit<ChainflipProgressFacts, "lastStatechainUpdateAt"> {
+  /** When Chainflip scheduled the egress to Asset Hub. */
+  egressScheduledAt?: number;
+  /** When the current confirmation count was first observed. */
+  confirmationsAt?: number;
+  /** When the current count of executed chunks was first observed. */
+  chunksAt?: number;
+}
+
+/** The deposit in a best block on Asset Hub, as the worker follows it until it is final. */
+export interface DepositInBlock {
+  /** The best block that first held it. */
+  block: number;
+  /** The finalized block number when it was first seen there. */
+  finalizedAtSeen: number;
+  /** The finalized block number at the worker's latest tick. */
+  finalized: number;
+  /** The best block number at the worker's latest tick. */
+  best: number;
+}
+
+/** The conversion transaction in a best block: successful, with the tier's conversion event. */
+export interface ConvertedTx {
+  txHash: string;
+  block: number;
+  at: number;
+  /** The worker's working time when it saw the conversion (`WorkerJobView.workedMs`). */
+  workedMs: number;
 }
 
 /** What the store extracts from one job in the worker's blob. */
@@ -144,6 +254,9 @@ export interface WorkerJobView {
   lastError?: string;
   fundsSeenAt: number | null;
   lastTickAt: number | null;
+  /** The time the worker really ran since the deposit was final, until it registered the claim:
+   *  ticks apart by more than 30 s count as 30 s. */
+  workedMs?: number;
   claim: {
     phase: WorkerClaimPhase;
     amount?: string;
@@ -151,10 +264,19 @@ export interface WorkerJobView {
     credited?: string;
     /** The host's last word on the top-up. */
     status?: string;
+    /** When the worker registered the claim with the host. */
+    registeredAt?: number;
+    /** The time the worker really ran since it registered this attempt. */
+    workedMs?: number;
     at: number;
   } | null;
   /** As the worker records them on either branch. */
   txs?: { call: "swap" | "xcm"; txHash: string; block?: number }[];
+  /** The PSM's refusals of the mint so far, when there were any; the third holds the job. */
+  psmRefusals?: number;
+  depositSeen?: DepositInBlock;
+  /** When the conversion first passed its dry run, and its transaction once converted. */
+  conversion?: { preparedAt: number; converted?: ConvertedTx };
 }
 
 export interface TopUpRecord {
@@ -181,6 +303,8 @@ export interface TopUpRecord {
   /** The funding leg's own network fee as the quote priced it. Not a component of `sourceFee`:
    *  the rail never reported it, the app priced it. */
   sourceChainFee?: string;
+  /** The PSM's fee on the mint as the quote priced it; PSM tier only, and the app's figure too. */
+  sourceMintFee?: string;
   meldCountry?: string;
   meldFundingRequestId?: string;
   /** Meld fiat requests only: the provider that took the payment (Transak, Koywe, ...). The
@@ -199,7 +323,6 @@ export interface TopUpRecord {
   refunded?: boolean;
   tradeN?: number;
   sourceId?: string;
-  progress: FundingProgressSnapshot;
   // Additive fields.
   route: "crypto" | "card" | "bank";
   deposit?: {
@@ -211,7 +334,28 @@ export interface TopUpRecord {
   };
   deadline: { depositExpiresAt: number | null; source: "rail" | "route" };
   handoff?: WorkerHandoffPayload;
+  /** The conversion tier the request was quoted on, kept on the record itself so a request whose
+   *  hand-off never persisted is still recovered on it rather than re-decided. A record from
+   *  before tiers were recorded has none and is a pool one. */
+  conversion?: ConversionRoute;
   refundAddress?: string;
+  /** Direct deposits only: what landed on the request's account when it is not what was asked,
+   *  less of the picked token or some of another. The request stays on its deposit while this is
+   *  set, and the buyer chooses to continue with what arrived or to take it back. */
+  depositMismatch?: DepositMismatchState;
+  /** When the host first reported the claim in a block with the full amount, before finality.
+   *  Set once and never cleared; the screens show a `claiming` record done from here. */
+  creditedAt?: number;
+  /** When the record first observed each fact the timeline measures time from. */
+  observedAt?: Partial<Record<ObservedFact, number>>;
+  /** A Chainflip swap's progress, from core's status reads. */
+  chainflip?: ChainflipFacts;
+  /** The worker's facts past the deposit, each kept from its first report. Only `finalized` and
+   *  `best` of the deposit move on. */
+  depositInBlock?: DepositInBlock;
+  conversionPreparedAt?: number;
+  converted?: ConvertedTx;
+  claimRegisteredAt?: number;
   status: RequestStatus;
   rail: RailState;
   failure?: RequestFailure;
@@ -224,14 +368,22 @@ export interface TopUpRecord {
           done: boolean;
           claimPhase?: WorkerClaimPhase;
           claimStatus?: string;
+          /** CASH the host minted on the claim so far. */
+          claimCredited?: string;
+          psmRefusals?: number;
           fundsSeenAt: number | null;
           lastTickAt: number | null;
+          /** The job's `workedMs` and its claim's, as the latest read gave them. */
+          workedMs?: number;
+          claimWorkedMs?: number;
           failure?: string;
           at: number;
           txs?: WorkerJobView["txs"];
         }
       | { known: false; at: number };
     provider?: { status: string; at: number };
+    /** Chainflip's own clock at its latest status read. */
+    chainflip?: { lastStatechainUpdateAt: number };
     chain?: {
       best?: { burnerNative: string; block?: number; at: number };
       finalized?: { burnerNative: string; block?: number; at: number };
@@ -242,13 +394,31 @@ export interface TopUpRecord {
   confirmedAt?: number;
 }
 
+/** The tier a record was quoted on, read off what it persisted and never decided here: the
+ *  hand-off it froze at quote time, or the tier recorded beside it when the hand-off is missing.
+ *  A record with neither is from before tiers were recorded, and so a pool one. */
+export const conversionRouteOf = (record: TopUpRecord): ConversionRoute =>
+  recordedRoute(record.handoff ?? record.conversion ?? {});
+
 // The withdrawal: the purse pays CASH to a disposable key on People, the worker moves it to Asset
-// Hub as PAS, and a rail carries the PAS to the destination the user named.
+// Hub as the token the user picked, or as PAS that a rail carries on to the destination they named.
 
 /** Every withdrawal runs under a source id of this shape: the prefix and the destination's id. */
 export const WITHDRAW_SOURCE_PREFIX = "wd:";
 export const isWithdrawSourceId = (sourceId: string | undefined): boolean =>
   sourceId !== undefined && sourceId.startsWith(WITHDRAW_SOURCE_PREFIX);
+
+/** The destination ids of a fiat sale, by the route that pays it out. */
+export const MELD_WITHDRAW_DESTINATIONS = { card: "meld-card", bank: "meld-bank" } as const;
+
+/** The route a withdrawal runs under, read off its source id: a fiat sale's card or bank, and
+ *  crypto for every other destination. */
+export function withdrawalRouteOf(sourceId: string | undefined): "crypto" | "card" | "bank" {
+  const tail = isWithdrawSourceId(sourceId) ? sourceId!.slice(WITHDRAW_SOURCE_PREFIX.length) : "";
+  if (tail === MELD_WITHDRAW_DESTINATIONS.card) return "card";
+  if (tail === MELD_WITHDRAW_DESTINATIONS.bank) return "bank";
+  return "crypto";
+}
 
 /** The worker's steps between the payment and the arrival on Asset Hub. */
 export type SendingStep = Exclude<WithdrawStep, "await-cash" | "done">;
@@ -291,7 +461,20 @@ export type WithdrawalFailureKind =
   /** The provider closed the channel before the key paid it; nothing moved. */
   | "channel-expired"
   /** The provider's record of the channel did not match the withdrawal; nothing moved. */
-  | "channel-mismatch";
+  | "channel-mismatch"
+  /** The price moved past what a sale promised its provider; the CASH is still on the key. */
+  | "unfundable"
+  /** Whether the provider was paid cannot be told from the chain; nothing more is sent. */
+  | "unresolved"
+  /** The provider ended the sale before the purse was asked. */
+  | "sale-ended"
+  /** The sale ran out of time before the purse was asked. */
+  | "sale-expired"
+  /** The provider asked for another amount or asset than the sale agreed; nothing was sent. */
+  | "sale-mismatch"
+  /** The provider closed the order, or no longer knows it, before the key paid it; the key's
+   *  funds go home. */
+  | "sale-closed";
 export interface WithdrawalFailure {
   kind: WithdrawalFailureKind;
   step: WithdrawalFailureStep;
@@ -328,9 +511,16 @@ export interface WithdrawalHandoffPayload {
   /** The CASH the user asked to withdraw, base units. */
   amount: string;
   destination: { chain: string; asset: string; address: string };
-  /** The Asset Hub account the PAS lands on: the rail's channel, or the destination itself. */
+  /** The Asset Hub account the funds land on: the rail's channel, or the destination itself. */
   landingHex: string;
   rail: WithdrawalRailState["provider"];
+  /** The sale on Asset Hub, decided from the destination at quote time and frozen here; the
+   *  worker consumes it and never re-decides. The pool sells for the native, and for `external`
+   *  sells that again for the stable; the psm redeems for `external` at `feeRate`, the Permill
+   *  read at quote time that the call's `max_fee` repeats; the dotUSD tier lands the CASH as it is. */
+  tier: ConversionRoute["tier"];
+  external?: Stable;
+  feeRate?: number;
   assetHubGenesis: string;
   peopleGenesis: string;
   peopleParaId: number;
@@ -339,8 +529,25 @@ export interface WithdrawalHandoffPayload {
   slippagePct: number;
   paymentExpiresAt: number;
   /** The provider's channel, opened on the page at confirm; the worker pays it. Present for
-   *  every rail but `direct`. */
+   *  every rail but `direct` by the time the worker is handed the request; a fiat sale gets it
+   *  once the provider names its deposit address. */
   channel?: WithdrawalChannel;
+  /** A fiat sale only: the adapter the worker reads the sale from, or `offline` for a build that
+   *  ran the stand-in sale and has no adapter. */
+  meld?: { baseUrl?: string; productId?: string; offline?: boolean };
+}
+
+/** The sale's fields as the hand-off carries them, spread from the route decided at quote time. */
+export function handoffSaleOf(
+  route: ConversionRoute,
+): Pick<WithdrawalHandoffPayload, "tier" | "external" | "feeRate"> {
+  if (route.tier === "psm") {
+    return { tier: "psm", external: route.external, feeRate: route.feeRate };
+  }
+  if (route.tier === "pool" && route.external !== undefined) {
+    return { tier: "pool", external: route.external };
+  }
+  return { tier: route.tier };
 }
 
 /** A provider's channel for one withdrawal: where the key pays, and what the quote promised. */
@@ -351,28 +558,86 @@ export interface WithdrawalChannel {
   openedAt: number;
   /** When the provider closes the channel (ms); 0 when it gave none. */
   expiresAt: number;
-  /** What the quote said would land, in the destination asset's base units. */
+  /** What the quote said would land, in the destination asset's base units: a fiat sale's in
+   *  cents of its fiat. */
   expectedEgress: string;
+  /** The exact planck the key pays, for a provider that holds it to its quote. Absent: the key
+   *  pays everything it holds. */
+  amount?: string;
+}
+
+/**
+ * A fiat sale through Meld: the provider's order, from the quote to its deposit address. Until
+ * the address is known the record waits on the seller's KYC and nothing is asked of the purse;
+ * then the hand-off gets its channel, and the payment window starts when the purse is asked.
+ */
+export interface MeldSale {
+  /** The adapter's funding request id, and the channel's id once the address is known. */
+  fundingRequestId: string;
+  serviceProvider: string;
+  country: string;
+  fiat: string;
+  paymentMethodType: string;
+  /** Where the seller does KYC and names the payout account. */
+  widgetUrl: string;
+  /** The exact planck the key pays the provider. */
+  cryptoAmount: string;
+  /** The fiat the quote said reaches the seller, decimal text in `fiat`. An estimate: the
+   *  provider prices the payout again. */
+  quotedPayout: string;
+  /** The quote's fee lines as the provider gave them, decimal text in `fiat`. */
+  fees?: { total?: string; transaction?: string; network?: string; partner?: string };
+  /** The adapter's last word on the sale, and the provider's own. */
+  status?: string;
+  providerStatus?: string;
+}
+
+/** One read of a sale as the adapter reports it. */
+export interface MeldSaleReading {
+  status: string;
+  providerStatus?: string;
+  deposit?: { address: string; amount: string; currency: string };
+  /** The provider named another address, or restated the amount or asset, after the deposit it
+   *  disclosed. */
+  depositConflictAt?: number;
 }
 
 /** What the store extracts from one withdrawal job in the worker's blob. */
 export interface WithdrawJobView {
   phase: string;
-  /** The whole job: the PAS reached the destination, or the provider delivered. */
+  /** The whole job: the funds reached the destination, or the provider delivered. */
   done: boolean;
-  /** The message leg: the PAS is on Asset Hub, on the destination or on the key for a provider. */
+  /** The message leg: the funds are on Asset Hub, on the destination or on the key for a
+   *  provider. */
   landed: boolean;
   failure?: string;
   lastError?: string;
   fundsSeenAt: number | null;
   lastTickAt: number | null;
-  txs?: { call: "swap" | "withdraw" | "sweep"; txHash: string; block?: number }[];
+  txs?: { call: "swap" | "withdraw" | "sweep" | "pay"; txHash: string; block?: number }[];
   /** The provider's latest word on the swap, once the worker has paid it. */
   rail?: SwapStatusResult;
+  /** A fiat sale only: what the sale left on the key once the provider was paid, planck, and its
+   *  way home as CASH. */
+  residue?: WithdrawalResidue;
 }
 
-/** `direct` for a destination on Asset Hub, which the PAS reaches with the XCM itself; the rest
- *  carry it on from the key's own Asset Hub account. */
+/** What a fiat sale left on its key: sent home as CASH through the funding engine, or kept on
+ *  the key when too small to be worth the fees of the way back. */
+export interface WithdrawalResidue {
+  /** Planck left on the key once the provider was paid; absent for a whole return. */
+  amount?: string;
+  returning: boolean;
+  /** The sale ended before the provider was paid, and everything the key held goes home. */
+  whole?: boolean;
+  /** The CASH it came back as reached the purse. */
+  returned?: boolean;
+  /** The funding job carrying it failed past the worker's retries; it needs a person. */
+  stuck?: boolean;
+}
+
+/** `direct` for a destination on Asset Hub, which the funds reach with the XCM itself; the rest
+ *  carry the PAS on from the key's own Asset Hub account. */
 export type WithdrawalRailProvider = "direct" | "chainflip" | "meld";
 export const WITHDRAWAL_RAILS: readonly WithdrawalRailProvider[] = ["direct", "chainflip", "meld"];
 export const isWithdrawalRail = (value: unknown): value is WithdrawalRailProvider =>
@@ -409,6 +674,10 @@ export interface WithdrawalRecord {
   status: WithdrawalStatus;
   rail: WithdrawalRailState;
   failure?: WithdrawalFailure;
+  /** A fiat sale only: the provider's order behind the rail. */
+  sale?: MeldSale;
+  /** A fiat sale only: what it left on the key, once the worker reported it. */
+  residue?: WithdrawalResidue;
   /** Base units of CASH the key was seen holding, once seen. */
   paidAmount?: string;
   witnesses: {
@@ -457,13 +726,18 @@ export type Observation =
     }
   | { source: "provider"; at: number; provider: "meld"; unreachable: true }
   | { source: "provider"; at: number; provider: "meld"; gone: true; message: string }
+  /** A fiat sale's order as the adapter reports it, read by the page until the worker has it. */
+  | { source: "provider"; at: number; provider: "meld"; sale: MeldSaleReading }
   | {
       source: "chain";
       at: number;
       burnerNative: string;
       finality: "best" | "finalized";
       block?: number;
-      via: "probe" | "pre-cancel" | "faucet";
+      via: "probe" | "pre-cancel";
+      /** Polkadot deposits, from the deposit watch only: a balance in a direct token the request
+       *  did not pick, or null when there is none. Absent from every other reading. */
+      stray?: StrayDeposit | null;
     }
   | { source: "clock"; at: number }
   /** A withdrawal's cancel carries no deadline: `depositExpiresAt` is 0. */
@@ -471,6 +745,9 @@ export type Observation =
   | { source: "user"; at: number; event: "retry" }
   | { source: "user"; at: number; event: "meld-submitted" }
   | { source: "user"; at: number; event: "deposit-skipped" }
+  /** The buyer took the mismatch sheet's offer: the request now asks for what arrived and pays
+   *  out what that converts to. */
+  | { source: "user"; at: number; event: "deposit-accepted"; terms: AcceptedDepositTerms }
   // Withdrawal observations. The worker's withdrawal job, the key's CASH on People, the host's
   // word on the payment, and the surface's own prompt, stamped with its id before it goes out.
   | { source: "worker"; at: number; withdrawJob: WithdrawJobView | null }
@@ -493,19 +770,43 @@ export type Observation =
       };
     }
   | { source: "user"; at: number; event: "payment-requested"; attempt: number; id: string }
+  /** The pool can no longer fund what a sale promised its provider, checked before the purse was
+   *  asked; the sale ends with nothing taken. */
+  | { source: "user"; at: number; event: "sale-unfundable" }
   /** The page opened a fresh provider channel for a retry; the hand-off carries it next. */
   | { source: "user"; at: number; event: "channel-opened"; channel: WithdrawalChannel };
 
 /** The source a request runs under: a bare legacy ref means the crypto rail's. */
 export const effectiveSourceId = (ref: RequestRef): string => ref.sourceId ?? CRYPTO_SOURCE_ID;
 
+/** A top-up the buyer pays by sending a Polkadot token straight to its account. Decided from the
+ *  network the buyer picked, since other crypto picks can run under the same source ids. */
+export const isDirectDeposit = (record: Pick<TopUpRecord, "chain" | "ref">): boolean =>
+  record.chain === "Polkadot" && isDirectSourceId(effectiveSourceId(record.ref));
+
+/**
+ * The balance at which a direct deposit counts as arrived: the figure the worker converts at, not
+ * the ask. The fixed-rate tiers and the stable pool carry it on the hand-off. The native pool's
+ * gate is the live quote plus the fee native, so it is the ask with its headroom taken back out.
+ */
+export function directDepositGate(record: Pick<TopUpRecord, "deposit" | "handoff">): bigint {
+  const asked = BigInt(record.deposit?.amount ?? "0");
+  const handoff = record.handoff;
+  if (handoff?.quotedDeposit !== undefined) return BigInt(handoff.quotedDeposit);
+  if (handoff !== undefined && handoff.tier === "pool" && handoff.external === undefined) {
+    const keep = BigInt(handoff.keepNativeForFees);
+    if (asked > keep) return keep + ((asked - keep) * 100n) / BigInt(100 + DIRECT_SLIPPAGE_PCT);
+  }
+  return asked;
+}
+
 export const routeOf = (sourceId: string): RequestRecord["route"] =>
   isMeldSourceId(sourceId) ? meldMethodFor(sourceId) : "crypto";
 
-/** The rail a source runs on: Meld for a fiat source, the manual deposit for the crypto rail's
- *  own source, Chainflip for every other coin. */
+/** The rail a source runs on: Meld for a fiat source, the manual deposit for a direct Asset Hub
+ *  source, Chainflip for every other coin. */
 export const railProviderOf = (sourceId: string): RailState["provider"] =>
-  isMeldSourceId(sourceId) ? "meld" : sourceId === CRYPTO_SOURCE_ID ? "manual" : "chainflip";
+  isMeldSourceId(sourceId) ? "meld" : isDirectSourceId(sourceId) ? "manual" : "chainflip";
 
 let clock: () => number = Date.now;
 
@@ -579,6 +880,22 @@ export const paymentTaken = (record: Pick<WithdrawalRecord, "payment">): boolean
   const { status } = record.payment;
   return status === "processing" || status === "completed" || status === "partiallyClaimed";
 };
+
+/** A fiat sale still waiting on the seller's KYC: the provider has named no deposit address, so
+ *  the worker has nothing to pay and the purse has not been asked. */
+export const saleAwaitingDeposit = (record: Pick<WithdrawalRecord, "sale" | "handoff">): boolean =>
+  record.sale !== undefined && record.handoff.channel === undefined;
+
+/** A fiat sale the purse has not been asked for yet, in KYC or past it: the page follows the
+ *  provider's order, whose ending ends the record with nothing taken, and the worker has nothing
+ *  to watch. */
+export const saleBeforePurse = (
+  record: Pick<WithdrawalRecord, "sale" | "status" | "payment">,
+): boolean =>
+  record.sale !== undefined &&
+  record.status.kind === "awaiting-payment" &&
+  record.payment.requestedAt === undefined &&
+  !paymentTaken(record);
 /**
  * Until when a top-up whose payment has not been seen is watched: the rail is still worth asking,
  * and the record is still worth keeping.

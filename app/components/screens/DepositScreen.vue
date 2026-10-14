@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { Copy } from "lucide-vue-next";
 import { estimateSourceAmount, estimateSourceFromCash } from "~~/lib/demo-rates";
 import { FUNDING_CHAINS } from "~~/lib/config";
@@ -8,6 +8,10 @@ import { shortAddress } from "../../utils/address";
 import { useFlowStore } from "../../stores/flow";
 import { useRequestsStore } from "../../stores/requests";
 import { useSessionStore } from "../../stores/session";
+import { depositQrValue } from "../../funding/deposit-qr";
+import { effectiveSourceId } from "../../funding/requests/model";
+import DepositMismatchSheet from "../funding/DepositMismatchSheet.vue";
+import RecoverDepositScreen from "./RecoverDepositScreen.vue";
 
 // Cancel is a request: the route swaps in the full-screen confirmation and performs the cancel.
 const emit = defineEmits<{ cancel: [] }>();
@@ -16,13 +20,39 @@ const session = useSessionStore();
 const requests = useRequestsStore();
 const flow = useFlowStore();
 
+/**
+ * The sheet over the deposit: a preview scene's, or a Polkadot deposit that arrived short or in
+ * another token. The buyer may close it to send the rest; it comes back when what arrived changes,
+ * which is when the record stamps the mismatch again.
+ */
+const dismissedAt = ref<number | null>(null);
+const mismatchAt = computed(() => requests.foregroundRecord?.depositMismatch?.at ?? null);
+const sheet = computed(() => {
+  if (flow.previewMismatch) return flow.previewMismatch;
+  return mismatchAt.value !== null && mismatchAt.value !== dismissedAt.value
+    ? session.depositMismatch
+    : null;
+});
+function dismissSheet() {
+  if (flow.previewMismatch) flow.previewMismatch = null;
+  else dismissedAt.value = mismatchAt.value;
+}
+function acceptSheet() {
+  if (flow.previewMismatch) flow.previewMismatch = null;
+  else void session.acceptDepositMismatch();
+}
+function recoverFromSheet() {
+  if (flow.previewMismatch) flow.previewMismatch = null;
+  else flow.recoveringDeposit = true;
+}
+
 // The record keeps the amount as a decimal string; the estimate takes the bigint core gave it.
 const deposit = computed(() => {
   const d = requests.foregroundRecord?.deposit;
   return requests.phase === "awaiting-deposit" && d ? { ...d, amount: BigInt(d.amount) } : null;
 });
 
-/** The address the QR and the copy row carry. */
+/** The address the copy row carries; the QR may wrap it in a payment URI. */
 const address = computed(() => deposit.value?.address ?? "");
 
 /** How much to send, split so the copy carries the bare number: the swap network's figure when it
@@ -46,12 +76,14 @@ const amount = computed<{ value: string; symbol: string; approx: boolean } | nul
       approx: true,
     };
   }
+  // A direct Polkadot deposit lands here: the manual rail quotes the exact deposit in the token
+  // the buyer picked.
   if (q?.send && q.symbol === q.sourceAsset) {
     const bare = q.send.endsWith(q.symbol) ? q.send.slice(0, -q.symbol.length).trim() : q.send;
     return { value: bare, symbol: q.symbol, approx: false };
   }
-  if (session.live && q?.sourceAsset) {
-    const estimate = estimateSourceAmount(d.amount, q.sourceAsset);
+  if (session.live && q?.sourceAsset && q.depositToken) {
+    const estimate = estimateSourceAmount(d.amount, q.depositToken, q.sourceAsset);
     if (estimate) return { value: estimate, symbol: q.sourceAsset, approx: true };
   }
   // The browser world's estimate scales from the CASH amount.
@@ -69,6 +101,20 @@ const amountText = computed(() => {
   return a ? `${a.approx ? "≈ " : ""}${a.value} ${a.symbol}` : "";
 });
 
+/** What the QR encodes: a payment URI a wallet can scan when the source has one and the figure
+ *  is the channel's own, the bare address otherwise. */
+const qrValue = computed(() => {
+  const record = requests.foregroundRecord;
+  const d = deposit.value;
+  if (!record || !d) return address.value;
+  return depositQrValue({
+    sourceId: effectiveSourceId(record.ref),
+    address: d.address,
+    amount: d.amount.toString(),
+    exact: amount.value?.approx === false,
+  });
+});
+
 const source = computed(() => {
   const chainName = session.quoted?.sourceChain ?? flow.srcChain.chain;
   const chain = FUNDING_CHAINS.find((candidate) => candidate.chain === chainName) ?? flow.srcChain;
@@ -76,8 +122,14 @@ const source = computed(() => {
   return { chain, asset };
 });
 
-// Cancel is offered only while nothing has been paid.
-const showCancel = computed(() => session.faucetState === "idle" && !requests.fundsSeen);
+// Cancel is offered only while nothing has been paid; a deposit that arrived short or in another
+// token has been, and the sheet over this screen is its way out.
+const showCancel = computed(
+  () =>
+    session.faucetState === "idle" &&
+    !requests.fundsSeen &&
+    requests.foregroundRecord?.depositMismatch === undefined,
+);
 
 // Either row's copy raises the shared pill above the buttons.
 const { copy: copyToClipboard } = useCopyToClipboard();
@@ -108,11 +160,14 @@ function copy(target: "amount" | "address") {
     </div>
   </section>
 
+  <!-- The way back for a Polkadot deposit the buyer does not want converted. -->
+  <RecoverDepositScreen v-else-if="flow.recoveringDeposit" @back="flow.recoveringDeposit = false" />
+
   <section v-else class="flex min-h-0 flex-1 flex-col">
     <!-- The one flexible block on the screen. Short webviews shrink the QR to a scannable
          floor. The basis carries the card's 288px plus this block's own 16px bottom gap. -->
     <div class="flex min-h-24 shrink basis-[19rem] justify-center pb-4">
-      <QrCard :value="address" />
+      <QrCard :value="qrValue" />
     </div>
 
     <!-- Each row copies its value; the pill above the buttons confirms. -->
@@ -174,6 +229,15 @@ function copy(target: "amount" | "address") {
       </div>
     </div>
   </section>
+
+  <DepositMismatchSheet
+    :mismatch="flow.recoveringDeposit ? null : sheet"
+    :busy="session.acceptingMismatch"
+    :error="session.mismatchError"
+    @accept="acceptSheet"
+    @recover="recoverFromSheet"
+    @dismiss="dismissSheet"
+  />
 </template>
 
 <style scoped>

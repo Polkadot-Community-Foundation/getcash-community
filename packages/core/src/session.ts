@@ -10,10 +10,12 @@ import {
   type FlowMode,
   type FlowState,
   type FlowStore,
+  type HandoffConversion,
 } from "./flow-store";
 import type { HandoffAction, HandoffKey } from "./handoff";
 import { fnv1a32Hex } from "./hash";
 import type {
+  ChainflipFailureInfo,
   EphemeralSigner,
   PaymentDeps,
   SourceAvailability,
@@ -138,6 +140,9 @@ export interface HandoffPaymentConfig extends PaymentConfigBase {
    */
   settlement?: SettlementAsset;
   settleAmount?: bigint;
+  /** The conversion route the caller decided for this request, written into the flow slot at
+   *  start so a recovery reads the tier instead of deciding one. Not read by core. */
+  conversion?: HandoffConversion;
 }
 
 export type PaymentConfig<T> = SpendPaymentConfig<T> | DeliverPaymentConfig | HandoffPaymentConfig;
@@ -242,10 +247,14 @@ const FAILURE_KINDS: readonly FailureKind[] = [
 ];
 const FAILURE_STEPS: readonly FailureStep[] = ["deposit", "swap", "mint"];
 
+/** The message of a Chainflip swap whose send to Asset Hub failed or went to the fallback. */
+export const CHAINFLIP_SEND_FAILED_MESSAGE =
+  "Chainflip exchanged your funds but couldn't send them.";
+
 const REFUND_FAILED: PaymentFailure = {
   kind: "refund-failed",
   step: "swap",
-  message: "The refund failed. Contact support with the deposit channel id.",
+  message: "Chainflip couldn't return your funds.",
   recoverable: false,
 };
 
@@ -255,6 +264,9 @@ function asciiBytes(s: string): Uint8Array {
   for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0x7f;
   return out;
 }
+
+const failureCode = (failure: ChainflipFailureInfo): { code?: string } =>
+  failure.reason?.code === undefined ? {} : { code: failure.reason.code };
 
 /** Map a Chainflip status result to the failure vocabulary. */
 function mapSwapFailure(r: SwapStatusResult): PaymentFailure {
@@ -266,23 +278,23 @@ function mapSwapFailure(r: SwapStatusResult): PaymentFailure {
       message:
         r.depositFailure.reason?.message ?? "Deposit rejected by Chainflip; funds not recoverable",
       recoverable: false,
+      ...failureCode(r.depositFailure),
     };
   }
   if (r.swapEgressFailure) {
     return {
       kind: r.swapEgressFailure.kind ?? "egress-failed",
       step: "swap",
-      message:
-        r.swapEgressFailure.reason?.message ??
-        "Swap egress failed; funds stuck on Chainflip. Contact support",
+      message: r.swapEgressFailure.reason?.message ?? CHAINFLIP_SEND_FAILED_MESSAGE,
       recoverable: false,
+      ...failureCode(r.swapEgressFailure),
     };
   }
   if (r.fallbackEgress) {
     return {
       kind: "fallback-egress",
       step: "swap",
-      message: "Funds routed to a fallback chain. Contact support",
+      message: CHAINFLIP_SEND_FAILED_MESSAGE,
       recoverable: false,
     };
   }
@@ -598,6 +610,10 @@ export function createPayment<T>(config: PaymentConfig<T>): PaymentSession<T> {
           quote: lastQuote,
           deposit: currentDeposit(),
           swap: result.status,
+          ...(result.progress === undefined ? {} : { progress: result.progress }),
+          ...(result.egress?.scheduledAt === undefined
+            ? {}
+            : { egressScheduledAt: result.egress.scheduledAt }),
         });
       }
 
@@ -939,6 +955,7 @@ export function createPayment<T>(config: PaymentConfig<T>): PaymentSession<T> {
         payload: "null",
         priceEvm: "0",
         handoffAmount: settleAmount.toString(),
+        ...(handoffCfg.conversion === undefined ? {} : { conversion: handoffCfg.conversion }),
         settlement,
         depositAddress: channel.deposit.address,
         depositChannelId: channel.depositChannelId,

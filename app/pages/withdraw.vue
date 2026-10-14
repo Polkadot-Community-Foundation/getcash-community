@@ -1,14 +1,25 @@
 <script setup lang="ts">
 // The withdrawal entry, at #/withdraw. The amount shell the top-up uses, with withdrawal wording
 // and the purse balance on offer, over the withdrawal route registry: crypto opens its package,
-// card and bank are not available yet. The pending and history screens list the withdrawals, and
-// opening one lands on its journey inside the package.
-import { computed, markRaw, onMounted, ref, shallowRef, type Component } from "vue";
+// card and bank open the fiat sale's where the build sells for fiat (`MELD_SELL_ENABLED`). The
+// pending and history screens list the withdrawals, and opening one lands on its journey inside
+// the package.
+import {
+  computed,
+  markRaw,
+  nextTick,
+  onMounted,
+  ref,
+  shallowRef,
+  watch,
+  type Component,
+} from "vue";
 import FundingSelectorScreen from "../components/funding/FundingSelectorScreen.vue";
+import WithdrawAmountScreen from "../components/withdraw/WithdrawAmountScreen.vue";
 import { usePurseBalance } from "../composables/usePurseBalance";
 import { useRoutePackageLoader } from "../composables/useRoutePackageLoader";
 import { useVisualViewportHeight } from "../composables/useVisualViewportHeight";
-import { fundingSelectorConfig } from "../funding/config";
+import { withdrawalSelectorConfig } from "../funding/config";
 import type {
   FundingHistoryReturnScreen,
   FundingShellEntryScreen,
@@ -23,7 +34,8 @@ import {
 import type { FundingRoute, FundingSelection } from "../funding/selection";
 import { projectFundingTopUps, type FundingTopUp } from "../funding/top-ups";
 import { useRequestsStore } from "../stores/requests";
-import { cashToAmountInput } from "../utils/cash";
+import { applyCurrentScene } from "../utils/dev-preview";
+import { previewStage, type PreviewStage } from "../utils/dev-preview-stage";
 import { WITHDRAWAL_LIST_WORDING, WITHDRAWAL_WORDING } from "../withdraw/rows";
 import { frontloadHostPermissions } from "~~/lib/host-frontload";
 
@@ -31,7 +43,7 @@ useVisualViewportHeight();
 const requests = useRequestsStore();
 
 const routeLabel = (route: FundingRoute): string =>
-  fundingSelectorConfig.routes.find(({ id }) => id === route)?.label ?? route;
+  withdrawalSelectorConfig.routes.find(({ id }) => id === route)?.label ?? route;
 const {
   selection,
   activePackage,
@@ -44,18 +56,22 @@ const {
 } = useRoutePackageLoader(getcashWithdrawPackages, routeLabel);
 const availableRoutes = availableFundingRoutes(
   getcashWithdrawPackages,
-  fundingSelectorConfig.routes.map(({ id }) => id),
+  withdrawalSelectorConfig.routes.map(({ id }) => id),
 );
 
-// The pill offers the purse balance as an amount the keypad can take. A skeleton while the read is
-// in flight, no pill where there is no purse.
 const purse = usePurseBalance();
-const available = computed<string | null | undefined>(() => {
-  const balance = purse.balance.value;
-  if (balance === undefined) return null;
-  if (balance === null) return undefined;
-  return cashToAmountInput(balance, fundingSelectorConfig.amount.decimals);
+const available = computed<bigint | null | undefined>(() => {
+  const purseState = purse.state.value;
+  if (purseState.kind === "unknown") return null;
+  if (purseState.kind === "none") return undefined;
+  return purseState.balance;
 });
+// A route error answers what the user just did, so it speaks first; the purse message clears
+// itself when a retry lands.
+const amountError = computed(
+  () =>
+    routeError.value ?? (purse.failed.value ? "Your balance couldn't be read. Retrying…" : null),
+);
 
 // One adapter per package with a list.
 const adapters = uniqueFundingPackages(getcashWithdrawPackages).flatMap((routePackage) =>
@@ -63,7 +79,7 @@ const adapters = uniqueFundingPackages(getcashWithdrawPackages).flatMap((routePa
 );
 const topUps = computed(() => adapters.flatMap((adapter) => adapter.topUps.value));
 const sections = computed(() =>
-  projectFundingTopUps(topUps.value, fundingSelectorConfig, WITHDRAWAL_WORDING),
+  projectFundingTopUps(topUps.value, withdrawalSelectorConfig, WITHDRAWAL_WORDING),
 );
 const topUpsReady = computed(() => requests.hydrated || requests.hostReadDone);
 
@@ -124,6 +140,8 @@ function returnFromTopUp() {
   activeTopUpId.value = null;
   openingTopUpId.value = null;
   topUpError.value = null;
+  // The watched withdrawal may have settled; the known balance stands, so nothing flickers.
+  void purse.refresh();
 }
 
 /** Back from a fresh withdrawal's package lands on the pending list, where it now shows. */
@@ -131,7 +149,55 @@ function returnFromPackage() {
   loadEpoch += 1;
   shellEntry.value = "pending";
   returnToShell();
+  // The package may have just spent from the purse: drop the known balance and fail closed
+  // until the re-read lands.
+  void purse.refresh({ spent: true });
 }
+
+/** The package's way back to the amount screen, with the amount still in it. */
+function changeAmount() {
+  loadEpoch += 1;
+  shellEntry.value = "amount";
+  returnToShell();
+}
+
+/**
+ * Puts this page where a preview scene's state can be read: the scene's withdrawal package for
+ * the `withdraw / …` scenes, the shell for the list scenes. The stages of the top-up page's
+ * containers are ignored — they live on `#/`. Returns whether anything moved. Dev and demo
+ * builds only — `previewStage` is null in every other.
+ */
+async function stagePreview(stage: PreviewStage): Promise<boolean> {
+  if (stage.kind === "withdraw-package") {
+    const route = stage.route ?? "crypto";
+    // The package is up; the route itself reads the stage's step and skeletons.
+    if (activePackage.value !== null && selection.value?.route === route) return false;
+    cancelPendingLoad();
+    activeTopUpPackage.value = null;
+    activeTopUpId.value = null;
+    // The section's design frames withdraw $25; a selection already on screen keeps its amount.
+    await continueToPackage({ amount: selection.value?.amount ?? "25", route });
+    return true;
+  }
+  if (stage.kind === "shell") {
+    if (activePackage.value === null && activeTopUpPackage.value === null) return false;
+    loadEpoch += 1;
+    activeTopUpPackage.value = null;
+    activeTopUpId.value = null;
+    openingTopUpId.value = null;
+    topUpError.value = null;
+    returnToShell();
+    return true;
+  }
+  return false;
+}
+
+watch(previewStage, async (stage) => {
+  if (stage === null || !(await stagePreview(stage))) return;
+  // The container is up; its own mount ran as it changed, so the scene's state goes on top again.
+  await nextTick();
+  await applyCurrentScene();
+});
 
 /** Upper bound on the permission front-load at launch. */
 const FRONTLOAD_TIMEOUT_MS = 20_000;
@@ -173,9 +239,12 @@ onMounted(async () => {
     :selection="selection"
     @back="returnFromPackage"
     @switch-route="switchRoute"
+    @change-amount="changeAmount"
   />
   <FundingSelectorScreen
     v-else-if="topUpsReady"
+    :amount-screen="WithdrawAmountScreen"
+    :config="withdrawalSelectorConfig"
     title="Withdraw funds"
     cta="Continue"
     :available="available"
@@ -183,7 +252,7 @@ onMounted(async () => {
     :available-routes="availableRoutes"
     :initial-screen="shellEntry"
     :history-return="historyReturn"
-    :error="routeError"
+    :error="amountError"
     :loading="loading"
     :top-ups="sections.inProgress"
     :past-top-ups="sections.past"
@@ -195,5 +264,12 @@ onMounted(async () => {
     @continue="continueToPackage"
     @open-top-up="openTopUp"
   />
-  <FundingSelectorScreen v-else skeleton />
+  <!-- The purse's read state carries into the skeleton, so the column doesn't jump on mount. -->
+  <FundingSelectorScreen
+    v-else
+    :amount-screen="WithdrawAmountScreen"
+    :config="withdrawalSelectorConfig"
+    :available="available"
+    skeleton
+  />
 </template>

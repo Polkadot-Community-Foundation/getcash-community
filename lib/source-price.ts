@@ -6,6 +6,7 @@ import {
   computeQuote,
   SOURCE_CONFIG_BY_ID,
   SourceMinimumNotMetError,
+  type EgressConfig,
   type QuoteBackend,
 } from "@getsome/chainflip";
 import { mainnetSdk } from "./chainflip-backend";
@@ -15,8 +16,6 @@ export interface SourcePrice {
   formatted: string;
   /** The same figure in the asset's base units. */
   baseUnits: bigint;
-  /** Chainflip's own estimate for the whole swap, when it offers one. */
-  etaSeconds?: number;
 }
 
 /** This purchase is under Chainflip's floor for the asset. */
@@ -42,12 +41,14 @@ export type SourcePriceResult =
 const DEFAULT_TIMEOUT_MS = 6_000;
 
 /**
- * Prices `targetNativeBase` (DOT plancks this purchase needs) in `sourceId`'s asset. Never
- * throws: every failure, including a timeout, comes back as a result.
+ * Prices `targetBaseUnits`, what this purchase needs delivered in `egress`'s base units, in
+ * `sourceId`'s asset. Never throws: every failure, including a timeout, comes back as a result.
  */
 export async function priceSourceLeg(args: {
   sourceId: SourceId;
-  targetNativeBase: bigint;
+  targetBaseUnits: bigint;
+  /** What the swap delivers: the route's deposit token on Asset Hub. */
+  egress: EgressConfig;
   backend?: QuoteBackend;
   timeoutMs?: number;
 }): Promise<SourcePriceResult> {
@@ -62,25 +63,21 @@ export async function priceSourceLeg(args: {
   );
   try {
     const backend = await Promise.race([args.backend ?? mainnetSdk(), deadline]);
-    // Overhead 0: the native budget already covers this flow's on-chain costs.
+    // Overhead 0: the deposit budget already covers this flow's on-chain costs.
     const quote = await Promise.race([
-      computeQuote(backend, source, args.targetNativeBase, 0n),
+      computeQuote(backend, source, args.targetBaseUnits, 0n, args.egress),
       deadline,
     ]);
     const raw = quote.raw as { estimatedDurationSeconds?: unknown } | null;
     const eta =
       typeof raw?.estimatedDurationSeconds === "number" ? raw.estimatedDurationSeconds : null;
     console.info(
-      `[coinage] source price: ${quote.source.formatted} ${source.shortName} for ${args.targetNativeBase} native` +
+      `[coinage] source price: ${quote.source.formatted} ${source.shortName} for ${args.targetBaseUnits} ${args.egress.asset}` +
         (eta === null ? "" : `, eta ${Math.round(eta)}s`),
     );
     return {
       kind: "price",
-      price: {
-        formatted: quote.source.formatted,
-        baseUnits: quote.source.amount,
-        ...(eta !== null ? { etaSeconds: eta } : {}),
-      },
+      price: { formatted: quote.source.formatted, baseUnits: quote.source.amount },
     };
   } catch (e) {
     if (e instanceof SourceMinimumNotMetError) {
