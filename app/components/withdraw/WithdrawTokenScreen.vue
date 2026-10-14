@@ -5,6 +5,7 @@
 // for the preview deck.
 import { computed } from "vue";
 import { useWithdrawOffersStore } from "../../stores/withdraw-offers";
+import { displayAsset } from "../../utils/testNetwork";
 import {
   destinationTokenIcon,
   type WithdrawDestination,
@@ -49,7 +50,7 @@ const rows = computed(() =>
         v-for="{ destination, state } in rows"
         :key="destination.id"
         :icon="destinationTokenIcon(destination)"
-        :label="destination.asset"
+        :label="displayAsset(destination.asset)"
         :subtitle="state.subtitle"
         :disabled="!state.pickable"
         @select="emit('pick', destination)"

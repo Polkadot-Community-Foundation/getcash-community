@@ -32,6 +32,7 @@ import type { FundingTopUpAdapter } from "../funding/top-up-adapter";
 import { projectFundingTopUps, type FundingTopUp } from "../funding/top-ups";
 import { useRequestsStore } from "../stores/requests";
 import { isDemoBuild } from "../utils/demo";
+import { testNetworkRoutes } from "../utils/testNetwork";
 import {
   applyCurrentScene,
   launchPreviewTopUps,
@@ -129,9 +130,11 @@ const activeTopUp = computed<FundingTopUp | null>(() => {
   return topUps.value.find(({ id }) => id === activeTopUpId.value) ?? null;
 });
 const topUpSections = computed(() => projectFundingTopUps(topUps.value, fundingSelectorConfig));
-const availableRoutes = availableFundingRoutes(
-  getcashRoutePackages,
-  fundingSelectorConfig.routes.map(({ id }) => id),
+const availableRoutes = testNetworkRoutes(
+  availableFundingRoutes(
+    getcashRoutePackages,
+    fundingSelectorConfig.routes.map(({ id }) => id),
+  ),
 );
 
 async function continueToPackage(next: FundingSelection) {

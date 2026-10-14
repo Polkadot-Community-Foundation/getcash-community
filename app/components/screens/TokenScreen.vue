@@ -6,6 +6,7 @@
 // all.
 import { computed } from "vue";
 import { networkIcon, tokenIcon } from "../../utils/icons";
+import { displayAsset } from "../../utils/testNetwork";
 import { groupTokens, tokenSubtitle } from "../../funding/source-groups";
 import { useFreshFloors } from "../../composables/useFreshFloors";
 import { useFlowStore } from "../../stores/flow";
@@ -56,7 +57,7 @@ function pick(token: TokenRow) {
           v-for="token in group.rows"
           :key="token.sourceId"
           :icon="tokenIcon(token.asset)"
-          :label="token.asset"
+          :label="displayAsset(token.asset)"
           :subtitle="tokenSubtitle(token.offer)"
           :disabled="!isPickable(token.offer)"
           :busy="flow.starting && token.asset === flow.srcAsset"
