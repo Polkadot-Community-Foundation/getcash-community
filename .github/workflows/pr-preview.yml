@@ -4,10 +4,7 @@ name: PR Preview
 # bulletin-deploy strips trailing digits from a label. The first push registers the name, paid
 # by the MNEMONIC account; names are never released. Keep that account funded.
 
-# PCF fork: previews target PRs into main only; the devnet branch has no preview path yet.
-on:
-  pull_request:
-    branches: [main]
+on: pull_request
 
 permissions:
   contents: read
@@ -29,7 +26,6 @@ jobs:
           faucet-seed: ${{ secrets.VITE_FAUCET_SEED }}
           meld-base-url: ${{ secrets.VITE_MELD_BASE_URL }}
           meld-product-id: ${{ secrets.VITE_MELD_PRODUCT_ID }}
-          test-network-notice: "true"
           # Fork and Dependabot PRs cannot read repo secrets and skip the deploy job; an
           # empty URL does not fail their build.
           require-meld-base-url: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' }}
