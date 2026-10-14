@@ -1,0 +1,48 @@
+name: Deploy (devnet)
+
+# PCF devnet: a push to `devnet` publishes `getcash.dot` on the pad `devnet` environment
+# (Paseo AH 1000 / People 1004 / Bulletin 1010). workflow_dispatch redeploys by hand.
+
+on:
+  push:
+    branches: [devnet]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Deploys write on-chain records. They queue and are never cancelled mid-flight.
+concurrency:
+  group: deploy-devnet
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build + gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/build-site
+        with:
+          faucet-seed: ${{ secrets.VITE_FAUCET_SEED }}
+          meld-base-url: ${{ secrets.VITE_MELD_BASE_URL }}
+          meld-product-id: ${{ secrets.VITE_MELD_PRODUCT_ID }}
+          test-network-notice: "true"
+
+  deploy:
+    needs: build
+    name: getcash (devnet)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # The manifest and worker record come from bulletin-deploy.config.ts in the checkout.
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/deploy-site
+        with:
+          domain: getcash.dot
+          env: devnet
+          # Owner of getcash.dot (5Fk8…).
+          mnemonic: ${{ secrets.MNEMONIC }}
