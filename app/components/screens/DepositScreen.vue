@@ -22,7 +22,7 @@ const requests = useRequestsStore();
 const flow = useFlowStore();
 
 // Demo builds fund the deposit from the faucet (Skip), so they show no real deposit target:
-// the QR carries no address and is blurred, and the address row is left out.
+// the QR encodes a placeholder that scans to no address, and the address row is left out.
 const faucetOnly = isDemoBuild();
 
 /**
@@ -172,13 +172,7 @@ function copy(target: "amount" | "address") {
     <!-- The one flexible block on the screen. Short webviews shrink the QR to a scannable
          floor. The basis carries the card's 288px plus this block's own 16px bottom gap. -->
     <div class="flex min-h-24 shrink basis-[19rem] justify-center pb-4">
-      <QrCard v-if="!faucetOnly" :value="qrValue" />
-      <div v-else class="relative flex h-full max-h-72 items-center justify-center">
-        <QrCard value="faucet-only" class="blur-xl" aria-hidden="true" />
-        <span class="absolute px-6 text-center text-label-l text-fg-primary">
-          Tap Skip to fund this test top-up
-        </span>
-      </div>
+      <QrCard :value="faucetOnly ? 'faucet-only' : qrValue" />
     </div>
 
     <!-- Each row copies its value; the pill above the buttons confirms. -->
