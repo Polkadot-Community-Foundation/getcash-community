@@ -36,7 +36,6 @@ import { projectFundingTopUps, type FundingTopUp } from "../funding/top-ups";
 import { useRequestsStore } from "../stores/requests";
 import { applyCurrentScene } from "../utils/dev-preview";
 import { previewStage, type PreviewStage } from "../utils/dev-preview-stage";
-import { testNetworkRoutes } from "../utils/testNetwork";
 import { WITHDRAWAL_LIST_WORDING, WITHDRAWAL_WORDING } from "../withdraw/rows";
 import { frontloadHostPermissions } from "~~/lib/host-frontload";
 
@@ -55,11 +54,9 @@ const {
   cancelPendingLoad: cancelPackageLoad,
   returnToShell,
 } = useRoutePackageLoader(getcashWithdrawPackages, routeLabel);
-const availableRoutes = testNetworkRoutes(
-  availableFundingRoutes(
-    getcashWithdrawPackages,
-    withdrawalSelectorConfig.routes.map(({ id }) => id),
-  ),
+const availableRoutes = availableFundingRoutes(
+  getcashWithdrawPackages,
+  withdrawalSelectorConfig.routes.map(({ id }) => id),
 );
 
 const purse = usePurseBalance();

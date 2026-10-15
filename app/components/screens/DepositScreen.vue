@@ -5,7 +5,6 @@ import { estimateSourceAmount, estimateSourceFromCash } from "~~/lib/demo-rates"
 import { FUNDING_CHAINS } from "~~/lib/config";
 import { useCopyToClipboard } from "../../composables/useCopyToClipboard";
 import { shortAddress } from "../../utils/address";
-import { displayAsset } from "../../utils/testNetwork";
 import { useFlowStore } from "../../stores/flow";
 import { useRequestsStore } from "../../stores/requests";
 import { useSessionStore } from "../../stores/session";
@@ -99,7 +98,7 @@ const amount = computed<{ value: string; symbol: string; approx: boolean } | nul
 });
 const amountText = computed(() => {
   const a = amount.value;
-  return a ? `${a.approx ? "≈ " : ""}${a.value} ${displayAsset(a.symbol)}` : "";
+  return a ? `${a.approx ? "≈ " : ""}${a.value} ${a.symbol}` : "";
 });
 
 /** What the QR encodes: a payment URI a wallet can scan when the source has one and the figure

@@ -20,7 +20,6 @@ import { learnSourceFloors } from "~~/lib/source-floors";
 import { isHosted } from "~~/lib/host-account";
 import { isDemoBuild } from "../utils/demo";
 import { chainflipRailOn } from "../utils/rail";
-import { isTestNetworkBuild } from "../utils/testNetwork";
 import type { DocumentLike } from "./requests";
 import { useSessionStore } from "./session";
 
@@ -126,7 +125,7 @@ export const useOffersStore = defineStore("offers", () => {
   const demoFallback = ref(isDemoBuild());
 
   /** Whether a pick can lead anywhere; see `chainflipRailOn`. A ref so tests can pin it. */
-  const railEnabled = ref(chainflipRailOn() && !isTestNetworkBuild());
+  const railEnabled = ref(chainflipRailOn());
 
   const fresh = (learned: Learned) => Date.now() - learned.learnedAt < FLOORS_STALE_MS;
 
