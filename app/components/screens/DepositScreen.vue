@@ -9,6 +9,7 @@ import { useFlowStore } from "../../stores/flow";
 import { useRequestsStore } from "../../stores/requests";
 import { useSessionStore } from "../../stores/session";
 import { depositQrValue } from "../../funding/deposit-qr";
+import { isDemoBuild } from "../../utils/demo";
 import { effectiveSourceId } from "../../funding/requests/model";
 import DepositMismatchSheet from "../funding/DepositMismatchSheet.vue";
 import RecoverDepositScreen from "./RecoverDepositScreen.vue";
@@ -19,6 +20,10 @@ const emit = defineEmits<{ cancel: [] }>();
 const session = useSessionStore();
 const requests = useRequestsStore();
 const flow = useFlowStore();
+
+// Demo builds fund the deposit from the faucet (Skip), so they show no real deposit target:
+// the QR carries no address and is blurred, and the address row is left out.
+const faucetOnly = isDemoBuild();
 
 /**
  * The sheet over the deposit: a preview scene's, or a Polkadot deposit that arrived short or in
@@ -167,7 +172,13 @@ function copy(target: "amount" | "address") {
     <!-- The one flexible block on the screen. Short webviews shrink the QR to a scannable
          floor. The basis carries the card's 288px plus this block's own 16px bottom gap. -->
     <div class="flex min-h-24 shrink basis-[19rem] justify-center pb-4">
-      <QrCard :value="qrValue" />
+      <QrCard v-if="!faucetOnly" :value="qrValue" />
+      <div v-else class="relative flex h-full max-h-72 items-center justify-center">
+        <QrCard value="faucet-only" class="blur-xl" aria-hidden="true" />
+        <span class="absolute px-6 text-center text-label-l text-fg-primary">
+          Tap Skip to fund this test top-up
+        </span>
+      </div>
     </div>
 
     <!-- Each row copies its value; the pill above the buttons confirms. -->
@@ -184,6 +195,7 @@ function copy(target: "amount" | "address") {
     </button>
 
     <button
+      v-if="!faucetOnly"
       type="button"
       class="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-stroke-primary text-left"
       @click="copy('address')"
