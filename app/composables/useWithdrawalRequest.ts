@@ -437,6 +437,7 @@ export function useWithdrawalRequest() {
           channel.address,
           sale,
           reservedFor(sale, ref),
+          record.handoff.slippagePct,
         );
       }
     } catch (e: unknown) {

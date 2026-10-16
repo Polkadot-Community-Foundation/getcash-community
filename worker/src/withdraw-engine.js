@@ -112,9 +112,9 @@ const saveJobs = () => store.save();
  *   landed,                                  // the message leg is done: the funds are on Asset Hub
  *   done, createdAt, armedAt, lastTickAt, lastError?,
  *   state: { attempts, rejections, submitted, destinationBefore, expectedLanding,
- *            fundsSeenAt, psmRefusals, waitingSince, exit?, redeemSubmitted?, redeemNonce?,
- *            redeemAnchor?, workedMs },
- *                                            // the two balances as decimal strings or null;
+ *            arrivalFloor, fundsSeenAt, psmRefusals, waitingSince, exit?, redeemSubmitted?,
+ *            redeemNonce?, redeemAnchor?, workedMs },
+ *                                            // the three amounts as decimal strings or null;
  *                                            // exit: where the PSM tier's CASH leaves the key
  *                                            // on Asset Hub, "psm" unless the user chose the
  *                                            // pool from a hold; redeemSubmitted: that exit's
@@ -1109,6 +1109,7 @@ async function tickRecord(record, nowMs) {
     state.submitted = !!record.state.submitted;
     state.destinationBefore = asBig(record.state.destinationBefore, null);
     state.expectedLanding = asBig(record.state.expectedLanding, null);
+    state.arrivalFloor = asBig(record.state.arrivalFloor, null);
     state.fundsSeenAt = record.state.fundsSeenAt ?? null;
     state.psmRefusals = record.state.psmRefusals ?? 0;
     state.waitingSince = record.state.waitingSince ?? null;
@@ -1127,6 +1128,7 @@ async function tickRecord(record, nowMs) {
         destinationBefore:
           state.destinationBefore === null ? null : String(state.destinationBefore),
         expectedLanding: state.expectedLanding === null ? null : String(state.expectedLanding),
+        arrivalFloor: state.arrivalFloor === null ? null : String(state.arrivalFloor),
         fundsSeenAt: state.fundsSeenAt,
         psmRefusals: state.psmRefusals,
         waitingSince: state.waitingSince,
