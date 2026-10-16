@@ -1437,7 +1437,8 @@ export const SCENES: Scene[] = [
     }),
   },
   {
-    // The settled card rides at the end of the running ones.
+    // The settled one is history's: the pending list draws only the running card, and the clock
+    // opens the screen that lists what landed.
     name: "list / top-up: settled",
     apply: topUpList({
       running: [{ ...BITCOIN_SWAP, amount: "50", stage: "waiting" }],
