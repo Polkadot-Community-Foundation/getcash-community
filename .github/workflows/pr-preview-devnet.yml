@@ -1,0 +1,89 @@
+name: PR Preview (devnet)
+
+# Every PR gets its own on-chain preview at `pr<N>-getcash.dot` on the PCF devnet. A PR into any
+# branch other than `devnet` is previewed merged with `devnet`, so it carries the devnet chain
+# facts and deploy config. The PR number is a prefix: DotNS strips trailing digits from a label.
+# The first push registers the name ("Available to all" tier, 10 PAS), paid by the MNEMONIC
+# account (5Fk8); names are never released. Keep that account funded.
+on: pull_request
+
+permissions:
+  contents: read
+
+# A re-push cancels the previous preview run; a cancelled registration resumes on the next run.
+concurrency:
+  group: pr-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build + gates
+    runs-on: ubuntu-latest
+    environment: devnet
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Merge devnet
+        if: github.base_ref != 'devnet'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-commit --no-ff origin/devnet; then
+            echo "::error::this PR does not merge cleanly with devnet, so it has no devnet preview"
+            exit 1
+          fi
+
+      - uses: ./.github/actions/build-site
+        with:
+          faucet-seed: ${{ secrets.VITE_FAUCET_SEED }}
+          chainflip-broker-api-key: ${{ secrets.VITE_CHAINFLIP_BROKER_API_KEY }}
+          meld-base-url: ${{ secrets.VITE_MELD_BASE_URL }}
+          meld-product-id: ${{ secrets.VITE_MELD_PRODUCT_ID }}
+          # Fork and Dependabot PRs cannot read secrets and skip the deploy job; empty
+          # values do not fail their build.
+          require-secrets: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' }}
+
+  deploy:
+    needs: build
+    name: Preview
+    runs-on: ubuntu-latest
+    # Fork and Dependabot PRs cannot read secrets; the deploy is skipped for them.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
+    environment: devnet
+    permissions:
+      contents: read
+      pull-requests: write # the sticky comment below posts the preview URL
+    steps:
+      # The manifest and worker record come from bulletin-deploy.config.ts, which the CLI
+      # finds by walking up from the build directory.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Merge devnet
+        if: github.base_ref != 'devnet'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-commit --no-ff origin/devnet
+
+      - uses: ./.github/actions/deploy-site
+        with:
+          # Full name, with the environment's TLD: the config's domain must equal it.
+          domain: pr${{ github.event.pull_request.number }}-getcash.dot
+          env: devnet
+          # Owner of the getcash name and the signer that registers each pr<N>- name.
+          mnemonic: ${{ secrets.MNEMONIC }}
+
+      - name: Comment the preview URL on the PR
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: bulletin-deploy
+          message: |
+            **pr${{ github.event.pull_request.number }}-getcash.dot** · [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            https://pr${{ github.event.pull_request.number }}-getcash.dev-dot.li
