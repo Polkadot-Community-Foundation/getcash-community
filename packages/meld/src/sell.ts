@@ -2,9 +2,16 @@
 // provider's channel before the key pays and as its status after. The worker asks both through
 // the same `GET /funding/:id` the page polls during KYC.
 
-import { NETWORK, TOKENS, type SwapStatusResult } from "@getsome/core";
+import {
+  meldAssetOf,
+  meldCodeOf,
+  NETWORK,
+  TOKENS,
+  type MeldAssetId,
+  type SwapStatusResult,
+} from "@getsome/core";
 import type { MeldClientLike, MeldQuoteEntry, MeldStatusResult } from "./client";
-import { formatBaseUnits, parseBaseUnits } from "./units";
+import { formatBaseUnits, parseBaseUnits, type MeldToken } from "./units";
 
 /** Whether this build sells CASH for fiat through Meld, the card and bank withdrawals. On a test
  *  network the sale only ever moves test funds. On a live one it stays off until a small real sale
@@ -13,21 +20,75 @@ import { formatBaseUnits, parseBaseUnits } from "./units";
  *  it, so neither trusts the other to hold the line. */
 export const MELD_SELL_ENABLED = NETWORK.testnet;
 
-/** What a sale sells: the native on Asset Hub, which Meld names DOT_ASSETHUB. */
-export const SELL_TOKEN = TOKENS.PAS;
+/** What a sale sells unless its code names another asset: the native on Asset Hub. */
+export const SELL_TOKEN: MeldToken = TOKENS.PAS as MeldToken;
+
+/** USDT on Asset Hub as a direct sale sells it: the PSM redeems the CASH for it, and the key pays
+ *  the provider in it. `meldCurrencyCode` is read from the adapter's asset table when used, so a
+ *  Meld rename reaches every sale without a release. */
+export const USDT_SELL_TOKEN: MeldToken = {
+  symbol: TOKENS.USDT.symbol,
+  decimals: TOKENS.USDT.decimals,
+  get meldCurrencyCode(): string {
+    return meldCodeOf("usdt@assethub");
+  },
+};
+
+/** What a direct sale sells, on Asset Hub with no swap, by the app's name for the asset. */
+const DIRECT_SELL_TOKENS: ReadonlyMap<MeldAssetId, MeldToken> = new Map<MeldAssetId, MeldToken>([
+  ["usdt@assethub", USDT_SELL_TOKEN],
+  ["dot@assethub", SELL_TOKEN],
+]);
+
+/** Whether a direct sale under `code` sells USDT. */
+export const isDirectUsdt = (code: string | undefined): boolean =>
+  meldAssetOf(code) === "usdt@assethub";
+
+/** Whether `code` is one a direct sale can sell: Meld's current code for USDT or DOT on Asset Hub. */
+export const isDirectSellCode = (code: string | undefined): boolean => {
+  const asset = meldAssetOf(code);
+  return asset !== undefined && DIRECT_SELL_TOKENS.has(asset);
+};
+
+/** The Meld codes a direct sale can sell, as the adapter names them now. */
+export const directSellCodes = (): string[] =>
+  [...DIRECT_SELL_TOKENS.values()].map((token) => token.meldCurrencyCode);
+
+/** What a direct sale of `asset` sells, or undefined for an asset no direct sale sells. Read by
+ *  the app's name for the asset, so a sale opened under a code Meld has since renamed still reads
+ *  as what it sold. */
+export const directSellTokenOf = (asset: MeldAssetId): MeldToken | undefined =>
+  DIRECT_SELL_TOKENS.get(asset);
+
+/** The direct sale's asset under `code`, one `isDirectSellCode` accepts. */
+export function directSellToken(code: string): MeldToken {
+  const asset = meldAssetOf(code);
+  const token = asset === undefined ? undefined : DIRECT_SELL_TOKENS.get(asset);
+  if (token === undefined) throw new Error(`A sale cannot sell ${code} directly.`);
+  return token;
+}
+
+/** Whether a deposit's asset code names what the sale sells: the same code, or another code the
+ *  adapter's table gives the same asset. */
+export const sameSoldAsset = (depositCode: string, soldCode: string): boolean => {
+  if (depositCode === soldCode) return true;
+  const asset = meldAssetOf(depositCode);
+  return asset !== undefined && asset === meldAssetOf(soldCode);
+};
 
 /** The fraction digits a committed amount carries. Few enough that no provider rounds it, and the
- *  planck below them stay with the rest of the sale. */
+ *  base units below them stay with the rest of the sale. */
 const SELL_AMOUNT_DECIMALS = 4;
 
-/** `planck` cut down to what a sale may commit, rounded down. */
-export function sellAmountOf(planck: bigint): bigint {
-  const step = 10n ** BigInt(SELL_TOKEN.decimals - SELL_AMOUNT_DECIMALS);
-  return (planck / step) * step;
+/** `base` units of `token` cut down to what a sale may commit, rounded down. */
+export function sellAmountOf(base: bigint, token: Pick<MeldToken, "decimals">): bigint {
+  const step = 10n ** BigInt(Math.max(token.decimals - SELL_AMOUNT_DECIMALS, 0));
+  return (base / step) * step;
 }
 
 /** The committed amount as the adapter and the provider see it. */
-export const formatSellAmount = (planck: bigint): string => formatBaseUnits(SELL_TOKEN, planck);
+export const formatSellAmount = (base: bigint, token: Pick<MeldToken, "decimals">): string =>
+  formatBaseUnits(token, base);
 
 /**
  * Providers Meld lists as running only the standard sell flow: their widget finishes the trade
@@ -62,13 +123,20 @@ export interface SaleChannelRecord {
 
 /**
  * The sale as a channel: where the key pays and how much the provider expects. Null when the
- * adapter is not disclosing a deposit, or discloses one the key must not pay: another asset, or
- * an amount that does not parse.
+ * adapter is not disclosing a deposit, or discloses one the key must not pay: an asset none of
+ * `tokens` names, or an amount that does not parse.
  */
-export function saleChannelOf(result: MeldStatusResult): SaleChannelRecord | null {
+export function saleChannelOf(
+  result: MeldStatusResult,
+  tokens: MeldToken | readonly MeldToken[],
+): SaleChannelRecord | null {
   const { deposit } = result;
-  if (deposit === undefined || deposit.currency !== SELL_TOKEN.meldCurrencyCode) return null;
-  const expectedAmount = parseBaseUnits(SELL_TOKEN, deposit.amount);
+  if (deposit === undefined) return null;
+  const token = (Array.isArray(tokens) ? tokens : [tokens as MeldToken]).find((t) =>
+    sameSoldAsset(deposit.currency, t.meldCurrencyCode),
+  );
+  if (token === undefined) return null;
+  const expectedAmount = parseBaseUnits(token, deposit.amount);
   if (expectedAmount === null || expectedAmount <= 0n) return null;
   return {
     depositAddress: deposit.address,
@@ -80,14 +148,12 @@ export function saleChannelOf(result: MeldStatusResult): SaleChannelRecord | nul
 
 /** Endings after the key paid, each in the seller's words. The payout is the provider's now. */
 const ENDINGS: Readonly<Record<string, string>> = Object.freeze({
-  failed: "The provider could not complete the payout. Contact support with your reference.",
-  expired:
-    "The sale closed at the provider before it saw the funds. Contact support with your reference.",
-  refused: "The provider did not accept this sale. Contact support with your reference.",
-  refunded: "The provider returned the funds instead of paying out. Contact support.",
-  unobserved:
-    "We could not confirm the payout with the provider. Contact support with your reference.",
-  changed: "The provider changed the sale after your payment. Contact support with your reference.",
+  failed: "The provider could not complete the payout.",
+  expired: "The sale closed at the provider before it saw the funds.",
+  refused: "The provider did not accept this sale.",
+  refunded: "The provider returned the funds instead of paying out.",
+  unobserved: "We could not confirm the payout with the provider.",
+  changed: "The provider changed the sale after your payment.",
 });
 
 /** The sale's status as the rail leg follows it once the key has paid. A deposit the provider
@@ -139,12 +205,14 @@ export interface SaleReadMemory {
  * after. A sale the adapter keeps answering 404 for (a reset database, a product id that changed)
  * is gone after SALE_GONE_AFTER reads in a row spanning SALE_GONE_FOR_MS: no channel to pay, so the
  * key goes home, or, once paid, a payout nobody can confirm. Short of that, and on any other
- * failure, the read throws and the next tick reads again.
+ * failure, the read throws and the next tick reads again. `tokens` is what the sale may sell, which
+ * the deposit is read in.
  */
 export function saleRail(
   client: MeldClientLike,
   memory: SaleReadMemory,
-  now: () => number = Date.now,
+  now: () => number,
+  tokens: MeldToken | readonly MeldToken[],
 ) {
   const read = async (fundingRequestId: string): Promise<MeldStatusResult | null> => {
     try {
@@ -166,7 +234,7 @@ export function saleRail(
   return {
     channel: async (fundingRequestId: string): Promise<SaleChannelRecord | null> => {
       const result = await read(fundingRequestId);
-      return result === null ? null : saleChannelOf(result);
+      return result === null ? null : saleChannelOf(result, tokens);
     },
     status: async (fundingRequestId: string): Promise<SwapStatusResult> =>
       saleStatusView((await read(fundingRequestId)) ?? { status: "unobserved" }),

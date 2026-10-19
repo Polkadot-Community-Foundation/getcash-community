@@ -1,11 +1,13 @@
 // The page's side of a fiat sale: confirm opens the provider's SELL session for the committed
 // figure, naming no wallet, and writes a record that waits on KYC, asking nothing of the
 // purse; the provider's deposit address becomes the channel; only then is the price checked and
-// the purse asked; a cancel during KYC withdraws the order at the provider too.
+// the purse asked, a PSM sale with this app's other redeems ahead spoken for; a cancel during KYC
+// withdraws the order at the provider too.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { createFakeMeldClient } from "@getsome/meld";
+import type { ConversionRoute } from "@getsome/funding";
 import {
   PAYMENT_WINDOW_MS,
   SALE_WINDOW_MS,
@@ -19,6 +21,7 @@ import {
   type WebStorageLike,
 } from "../app/funding/requests/storage";
 import { useRequestsStore } from "../app/stores/requests";
+import { requestRefOf } from "../app/utils/request-index";
 import { setMeldSellClient } from "../app/withdraw/meld-client";
 import { FIXTURE_NOW } from "./fixtures/requests";
 
@@ -57,6 +60,7 @@ vi.mock("../lib/withdraw-live", () => ({
   probeWithdrawKey: vi.fn(async () => ({ address: KEY_ADDRESS, cash: 0n })),
   readPaymentStatus: async () => ({ status: "not-found" }),
   meldCommitmentFundable: vi.fn(async () => true),
+  openSwapSaleChannel: vi.fn(),
   meldHandoffConfig: () => ({ baseUrl: "https://adapter.test", productId: "getcash.dev" }),
   withdrawHandoff: (
     args: Record<string, unknown> & { key: { address: string; publicKeyHex: string } },
@@ -68,6 +72,7 @@ vi.mock("../lib/withdraw-live", () => ({
     destination: args.destination,
     landingHex: args.landingHex,
     rail: args.rail,
+    ...(args.sale as Record<string, unknown>),
     assetHubGenesis: "0xah",
     peopleGenesis: "0xpe",
     peopleParaId: 1004,
@@ -85,6 +90,7 @@ import { useWithdrawalRequest } from "../app/composables/useWithdrawalRequest";
 const handedOff = vi.mocked(live.sendWithdrawHandoff);
 const asked = vi.mocked(live.requestKeyPayment);
 const fundable = vi.mocked(live.meldCommitmentFundable);
+const openSwap = vi.mocked(live.openSwapSaleChannel);
 const advanced = vi.mocked(live.advanceWithdrawCounter);
 const probed = vi.mocked(live.probeWithdrawKey);
 
@@ -107,6 +113,47 @@ const QUOTE = {
   destinationAmount: "90.12",
   totalFee: "3.10",
   partnerFee: "0.50",
+};
+const PSM_SALE: ConversionRoute = { tier: "psm", external: "USDT", feeRate: 5_000 };
+/** What the PSM sale of 100 CASH commits, in USDT. */
+const PSM_COMMITTED = 98_668_800n;
+
+/** Another PSM withdrawal of this app, converting under the worker: 50 CASH ahead of any sale. */
+const CONVERTING_PSM_WITHDRAWAL: WithdrawalRecord = {
+  schema: 2,
+  kind: "withdrawal",
+  ref: requestRefOf("wd:usdt-assethub", 1),
+  rev: 0,
+  updatedAt: FIXTURE_NOW,
+  startedAt: FIXTURE_NOW,
+  amountHuman: "50",
+  route: "crypto",
+  destination: { chain: "Asset Hub", asset: "USDT", address: NEXT_KEY_ADDRESS },
+  key: { label: "wd:eph:usdt-assethub:1", address: NEXT_KEY_ADDRESS, publicKeyHex: KEY_HEX },
+  payment: { attempt: 0, requestedAt: FIXTURE_NOW, id: "pay-1" },
+  deadline: { paymentExpiresAt: FIXTURE_NOW + PAYMENT_WINDOW_MS },
+  handoff: {
+    label: "wd:eph:usdt-assethub:1",
+    keyAddress: NEXT_KEY_ADDRESS,
+    keyPublicKeyHex: KEY_HEX,
+    amount: "50000000",
+    destination: { chain: "Asset Hub", asset: "USDT", address: NEXT_KEY_ADDRESS },
+    landingHex: KEY_HEX,
+    rail: "direct",
+    tier: "psm",
+    external: "USDT",
+    feeRate: 5_000,
+    assetHubGenesis: "0xah",
+    peopleGenesis: "0xpe",
+    peopleParaId: 1004,
+    assetHubParaId: 1000,
+    poolAccount: "5Pool",
+    slippagePct: 5,
+    paymentExpiresAt: FIXTURE_NOW + PAYMENT_WINDOW_MS,
+  },
+  status: { kind: "converting", at: FIXTURE_NOW, step: "convert" },
+  rail: { provider: "direct", stage: "waiting", updatedAt: FIXTURE_NOW },
+  witnesses: {},
 };
 
 describe("a fiat sale from the page", () => {
@@ -139,7 +186,8 @@ describe("a fiat sale from the page", () => {
     setMeldSellClient(null);
   });
 
-  const startSale = () =>
+  /** A sale of DOT out of the pool, or of USDT out of the PSM, as the quote decided it. */
+  const startSale = (sale: ConversionRoute = { tier: "pool" }, cryptoAmount = COMMITTED) =>
     useWithdrawalRequest().startSale({
       method: "bank",
       amount: 100_000_000n,
@@ -147,7 +195,9 @@ describe("a fiat sale from the page", () => {
       fiat: "EUR",
       paymentMethodType: "SEPA",
       quote: QUOTE,
-      cryptoAmount: COMMITTED,
+      cryptoAmount,
+      route: sale,
+      ...(sale.tier === "psm" ? { sellCode: "USDT_DOT" } : {}),
     });
 
   /** Reads the sale until the provider names its deposit address. */
@@ -160,6 +210,131 @@ describe("a fiat sale from the page", () => {
     return requests.get(ref) as WithdrawalRecord;
   }
 
+  it("opens a direct sale of DOT under the code the adapter's table names it by", async () => {
+    const spy = vi.spyOn(meld, "createSellSession");
+    const outcome = await useWithdrawalRequest().startSale({
+      method: "bank",
+      amount: 100_000_000n,
+      country: "GB",
+      fiat: "GBP",
+      paymentMethodType: "UK_FASTER_PAYMENTS",
+      quote: { ...QUOTE, serviceProvider: "ONRAMPMONEY" },
+      cryptoAmount: COMMITTED,
+      sellCode: "DOT",
+    });
+    expect(outcome.ok).toBe(true);
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        serviceProvider: "ONRAMPMONEY",
+        sourceCurrencyCode: "DOT",
+        sourceAmount: "23.4521",
+        destinationCurrencyCode: "GBP",
+      }),
+    );
+  });
+
+  it("refuses a direct sale under a code it cannot sell, opening nothing", async () => {
+    const spy = vi.spyOn(meld, "createSellSession");
+    const outcome = await useWithdrawalRequest().startSale({
+      method: "bank",
+      amount: 100_000_000n,
+      country: "GB",
+      fiat: "GBP",
+      paymentMethodType: "UK_FASTER_PAYMENTS",
+      quote: QUOTE,
+      cryptoAmount: COMMITTED,
+      sellCode: "USDC_DOT",
+    });
+    expect(outcome).toEqual({ ok: false, reason: "A sale cannot sell USDC_DOT." });
+    expect(spy).not.toHaveBeenCalled();
+    expect(advanced).not.toHaveBeenCalled();
+  });
+
+  /** 25 USDT, the figure a direct sale of USDT commits to. */
+  const USDT_COMMITTED = 25_000_000n;
+  const REDEEM = { tier: "psm", external: "USDT", feeRate: 1_000 } as const;
+  const startUsdtSale = (
+    over: Partial<Parameters<ReturnType<typeof useWithdrawalRequest>["startSale"]>[0]> = {},
+  ) =>
+    useWithdrawalRequest().startSale({
+      method: "bank",
+      amount: 30_000_000n,
+      country: "GB",
+      fiat: "GBP",
+      paymentMethodType: "UK_FASTER_PAYMENTS",
+      quote: { ...QUOTE, serviceProvider: "ONRAMPMONEY" },
+      cryptoAmount: USDT_COMMITTED,
+      sellCode: "USDT_DOT",
+      route: REDEEM,
+      ...over,
+    });
+
+  it.each(["USDT_DOT"])(
+    "opens a direct sale of USDT under %s, the CASH redeemed for it",
+    async (sellCode) => {
+      const spy = vi.spyOn(meld, "createSellSession");
+      const outcome = await startUsdtSale({ sellCode });
+      if (!outcome.ok) throw new Error(outcome.reason);
+      expect(spy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serviceProvider: "ONRAMPMONEY",
+          sourceCurrencyCode: sellCode,
+          sourceAmount: "25",
+          destinationCurrencyCode: "GBP",
+        }),
+      );
+      const record = useRequestsStore().get(outcome.ref) as WithdrawalRecord;
+      expect(record.sale).toMatchObject({
+        sellCode,
+        // The asset too, which the record is read by if Meld renames the code during KYC.
+        asset: "usdt@assethub",
+        cryptoAmount: USDT_COMMITTED.toString(),
+      });
+      expect(record.sale?.lane).toBeUndefined();
+      expect(record.handoff).toMatchObject({ rail: "meld", ...REDEEM });
+      expect(record.handoff.swap).toBeUndefined();
+    },
+  );
+
+  it.each(["USDT_DOT"])(
+    "takes a %s deposit for its exact figure and checks the redeem before the purse",
+    async (sellCode) => {
+      const outcome = await startUsdtSale({ sellCode });
+      if (!outcome.ok) throw new Error(outcome.reason);
+      const known = await toDeposit(outcome.ref);
+      expect(known.status.kind).toBe("awaiting-payment");
+      expect(known.handoff.channel).toMatchObject({
+        id: "mock-sell-1",
+        amount: USDT_COMMITTED.toString(),
+      });
+
+      expect(await useWithdrawalRequest().paySale(outcome.ref)).toEqual({ ok: true });
+      expect(fundable).toHaveBeenCalledWith(
+        30_000_000n,
+        USDT_COMMITTED,
+        known.handoff.channel!.address,
+        REDEEM,
+        0n,
+        known.handoff.slippagePct,
+      );
+      expect(handedOff).toHaveBeenCalledTimes(1);
+      expect(handedOff.mock.calls[0]![2]).toMatchObject({
+        ...REDEEM,
+        channel: { id: "mock-sell-1", amount: USDT_COMMITTED.toString() },
+      });
+    },
+  );
+
+  it("refuses a sale of USDT without its redeem, and a sale of DOT with one", async () => {
+    const spy = vi.spyOn(meld, "createSellSession");
+    const mismatch = { ok: false, reason: "The sale's asset and its conversion do not match." };
+    expect(await startUsdtSale({ route: undefined })).toEqual(mismatch);
+    expect(await startUsdtSale({ route: { tier: "pool" } })).toEqual(mismatch);
+    expect(await startUsdtSale({ sellCode: "DOT" })).toEqual(mismatch);
+    expect(await startUsdtSale({ sellCode: undefined })).toEqual(mismatch);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
   it("opens the sale for the committed figure and waits on KYC, asking nothing yet", async () => {
     const spy = vi.spyOn(meld, "createSellSession");
     const outcome = await startSale();
@@ -168,7 +343,7 @@ describe("a fiat sale from the page", () => {
       expect.objectContaining({
         serviceProvider: "TRANSAK",
         orderRef: KEY_ADDRESS,
-        sourceCurrencyCode: "DOT_ASSETHUB",
+        sourceCurrencyCode: "DOT",
         sourceAmount: "23.4521",
         destinationCurrencyCode: "EUR",
         paymentMethodType: "SEPA",
@@ -218,7 +393,15 @@ describe("a fiat sale from the page", () => {
 
     const paid = await useWithdrawalRequest().paySale(outcome.ref);
     expect(paid).toEqual({ ok: true });
-    expect(fundable).toHaveBeenCalledWith(100_000_000n, COMMITTED, known.handoff.channel!.address);
+    // Checked at the slippage the hand-off holds the worker to.
+    expect(fundable).toHaveBeenCalledWith(
+      100_000_000n,
+      COMMITTED,
+      known.handoff.channel!.address,
+      { tier: "pool" },
+      0n,
+      known.handoff.slippagePct,
+    );
     expect(asked).toHaveBeenCalledWith(expect.objectContaining({ amount: 100_000_000n }));
     expect(handedOff).toHaveBeenCalledTimes(1);
     const [, , payload] = handedOff.mock.calls[0]!;
@@ -226,6 +409,50 @@ describe("a fiat sale from the page", () => {
       rail: "meld",
       channel: { id: "mock-sell-1", amount: COMMITTED.toString() },
       meld: { baseUrl: "https://adapter.test" },
+    });
+  });
+
+  it("decides a PSM sale again before the purse, with this app's other redeems ahead spoken for", async () => {
+    const requests = useRequestsStore();
+    await requests.create(CONVERTING_PSM_WITHDRAWAL.ref, CONVERTING_PSM_WITHDRAWAL);
+    const outcome = await startSale(PSM_SALE, PSM_COMMITTED);
+    if (!outcome.ok) throw new Error(outcome.reason);
+    const known = await toDeposit(outcome.ref);
+    expect(await useWithdrawalRequest().paySale(outcome.ref)).toEqual({ ok: true });
+    // The 50 CASH converting ahead count against the pair's room; the sale's own 100 do not.
+    expect(fundable).toHaveBeenCalledWith(
+      100_000_000n,
+      PSM_COMMITTED,
+      known.handoff.channel!.address,
+      PSM_SALE,
+      50_000_000n,
+      known.handoff.slippagePct,
+    );
+    expect(asked).toHaveBeenCalledWith(expect.objectContaining({ amount: 100_000_000n }));
+    expect(handedOff).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends a PSM sale the pair can no longer serve with nothing taken", async () => {
+    const outcome = await startSale(PSM_SALE, PSM_COMMITTED);
+    if (!outcome.ok) throw new Error(outcome.reason);
+    const known = await toDeposit(outcome.ref);
+    // The pair filled up or repriced during KYC: the check decided the sale again and answered no.
+    fundable.mockResolvedValue(false);
+    const paid = await useWithdrawalRequest().paySale(outcome.ref);
+    expect(paid).toEqual({ ok: false, reason: "The price moved too far while you verified." });
+    expect(fundable).toHaveBeenCalledWith(
+      100_000_000n,
+      PSM_COMMITTED,
+      expect.any(String),
+      PSM_SALE,
+      0n,
+      known.handoff.slippagePct,
+    );
+    expect(asked).not.toHaveBeenCalled();
+    expect(handedOff).not.toHaveBeenCalled();
+    expect(useRequestsStore().get(outcome.ref)).toMatchObject({
+      status: { kind: "failed", recoverable: false },
+      failure: { kind: "unfundable" },
     });
   });
 
@@ -432,63 +659,137 @@ describe("a fiat sale from the page", () => {
     const [, , payload] = handedOff.mock.calls[0]!;
     expect(payload).toMatchObject({ paymentExpiresAt: askedAt + PAYMENT_WINDOW_MS });
   });
-});
 
-describe("a fiat sale in a build that cannot run one", () => {
-  beforeEach(() => {
-    setActivePinia(createPinia());
-    setRecordStorage(createMemoryKeyedStorage());
-    setMirrorStorage(fakeWebStorage());
-    setRequestsClock(() => FIXTURE_NOW);
-    advanced.mockClear();
-  });
-  afterEach(() => {
-    vi.restoreAllMocks();
-    setRequestsClock(Date.now);
-    setMirrorStorage(null);
-    setMeldSellClient(null);
+  describe("through an offramp lane", () => {
+    const LANE_COMMITTED = 24_000_000n;
+    const REDEEM = { tier: "psm", external: "USDT", feeRate: 1_000 } as const;
+    const swapChannel = (id: string, expiresAt: number) => ({
+      id,
+      address: "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
+      openedAt: FIXTURE_NOW,
+      expiresAt,
+      expectedEgress: LANE_COMMITTED.toString(),
+      amount: "25100000",
+    });
+
+    beforeEach(() => {
+      openSwap.mockReset().mockResolvedValue(swapChannel("cf-fresh", FIXTURE_NOW + 3_600_000));
+    });
+
+    async function laneSaleAtDeposit() {
+      const outcome = await useWithdrawalRequest().startSale({
+        method: "bank",
+        amount: 30_000_000n,
+        country: "GB",
+        fiat: "GBP",
+        paymentMethodType: "UK_FASTER_PAYMENTS",
+        quote: QUOTE,
+        cryptoAmount: LANE_COMMITTED,
+        swap: { lane: "usdc-solana", route: REDEEM },
+      });
+      if (!outcome.ok) throw new Error(outcome.reason);
+      await toDeposit(outcome.ref);
+      return outcome.ref;
+    }
+
+    it("keeps a swap opened earlier while the key still has time to pay it", async () => {
+      const ref = await laneSaleAtDeposit();
+      const kept = swapChannel("cf-kept", FIXTURE_NOW + 3_600_000);
+      await useRequestsStore().observe(ref, {
+        source: "user",
+        at: FIXTURE_NOW,
+        event: "swap-opened",
+        channel: kept,
+      });
+      expect(await useWithdrawalRequest().paySale(ref)).toEqual({ ok: true });
+      expect(openSwap).not.toHaveBeenCalled();
+      expect((useRequestsStore().get(ref) as WithdrawalRecord).handoff.swap?.id).toBe("cf-kept");
+    });
+
+    it("opens a fresh swap in place of one about to close", async () => {
+      const ref = await laneSaleAtDeposit();
+      await useRequestsStore().observe(ref, {
+        source: "user",
+        at: FIXTURE_NOW,
+        event: "swap-opened",
+        channel: swapChannel("cf-stale", FIXTURE_NOW + 60_000),
+      });
+      expect(await useWithdrawalRequest().paySale(ref)).toEqual({ ok: true });
+      expect(openSwap).toHaveBeenCalledTimes(1);
+      expect((useRequestsStore().get(ref) as WithdrawalRecord).handoff.swap?.id).toBe("cf-fresh");
+    });
+
+    it("opens a fresh swap in place of one the worker would refuse once the purse has paid", async () => {
+      // Twenty minutes left: past the worker's own margin, but not past it plus the purse's window.
+      const ref = await laneSaleAtDeposit();
+      await useRequestsStore().observe(ref, {
+        source: "user",
+        at: FIXTURE_NOW,
+        event: "swap-opened",
+        channel: swapChannel("cf-short", FIXTURE_NOW + 20 * 60_000),
+      });
+      expect(await useWithdrawalRequest().paySale(ref)).toEqual({ ok: true });
+      expect(openSwap).toHaveBeenCalledTimes(1);
+      expect((useRequestsStore().get(ref) as WithdrawalRecord).handoff.swap?.id).toBe("cf-fresh");
+    });
   });
 
-  it("refuses before taking a number, with no client or no adapter for the worker", async () => {
-    const meldClient = await import("../app/withdraw/meld-client");
-    vi.spyOn(meldClient, "meldSellClient").mockReturnValue(null);
-    const outcome = await useWithdrawalRequest().startSale({
-      method: "card",
-      amount: 100_000_000n,
-      country: "DE",
-      fiat: "EUR",
-      paymentMethodType: "CREDIT_DEBIT_CARD",
-      quote: QUOTE,
-      cryptoAmount: COMMITTED,
+  describe("a fiat sale in a build that cannot run one", () => {
+    beforeEach(() => {
+      setActivePinia(createPinia());
+      setRecordStorage(createMemoryKeyedStorage());
+      setMirrorStorage(fakeWebStorage());
+      setRequestsClock(() => FIXTURE_NOW);
+      advanced.mockClear();
     });
-    expect(outcome).toEqual({
-      ok: false,
-      reason: "Card and bank withdrawals are not available right now.",
+    afterEach(() => {
+      vi.restoreAllMocks();
+      setRequestsClock(Date.now);
+      setMirrorStorage(null);
+      setMeldSellClient(null);
     });
-    expect(advanced).not.toHaveBeenCalled();
-    expect(useRequestsStore().withdrawals).toEqual([]);
-  });
 
-  it("refuses before taking a number on a network where CASH cannot reach Asset Hub", async () => {
-    const meld = createFakeMeldClient();
-    const opened = vi.spyOn(meld, "createSellSession");
-    setMeldSellClient(meld);
-    vi.mocked(live.cashCanMove).mockResolvedValueOnce(false);
-    const outcome = await useWithdrawalRequest().startSale({
-      method: "bank",
-      amount: 100_000_000n,
-      country: "DE",
-      fiat: "EUR",
-      paymentMethodType: "SEPA",
-      quote: QUOTE,
-      cryptoAmount: COMMITTED,
+    it("refuses before taking a number, with no client or no adapter for the worker", async () => {
+      const meldClient = await import("../app/withdraw/meld-client");
+      vi.spyOn(meldClient, "meldSellClient").mockReturnValue(null);
+      const outcome = await useWithdrawalRequest().startSale({
+        method: "card",
+        amount: 100_000_000n,
+        country: "DE",
+        fiat: "EUR",
+        paymentMethodType: "CREDIT_DEBIT_CARD",
+        quote: QUOTE,
+        cryptoAmount: COMMITTED,
+      });
+      expect(outcome).toEqual({
+        ok: false,
+        reason: "Card and bank withdrawals are not available right now.",
+      });
+      expect(advanced).not.toHaveBeenCalled();
+      expect(useRequestsStore().withdrawals).toEqual([]);
     });
-    expect(outcome).toEqual({
-      ok: false,
-      reason: "This network does not let CASH move from People to Asset Hub.",
+
+    it("refuses before taking a number on a network where CASH cannot reach Asset Hub", async () => {
+      const meld = createFakeMeldClient();
+      const opened = vi.spyOn(meld, "createSellSession");
+      setMeldSellClient(meld);
+      vi.mocked(live.cashCanMove).mockResolvedValueOnce(false);
+      const outcome = await useWithdrawalRequest().startSale({
+        method: "bank",
+        amount: 100_000_000n,
+        country: "DE",
+        fiat: "EUR",
+        paymentMethodType: "SEPA",
+        quote: QUOTE,
+        cryptoAmount: COMMITTED,
+      });
+      expect(outcome).toEqual({
+        ok: false,
+        reason: "This network does not let CASH move from People to Asset Hub.",
+      });
+      expect(opened).not.toHaveBeenCalled();
+      expect(advanced).not.toHaveBeenCalled();
+      expect(useRequestsStore().withdrawals).toEqual([]);
     });
-    expect(opened).not.toHaveBeenCalled();
-    expect(advanced).not.toHaveBeenCalled();
-    expect(useRequestsStore().withdrawals).toEqual([]);
   });
 });

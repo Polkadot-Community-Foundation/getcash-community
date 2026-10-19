@@ -7,15 +7,22 @@ import {
   NETWORK,
   TOKENS,
   type ChainflipRail,
+  type MeldAssetId,
   type PaymentState,
+  type Quote,
   type SourceId,
   type TokenSpec,
 } from "@getsome/core";
-import { egressFor, SOURCE_CONFIG_BY_ID, type ChainflipToken } from "@getsome/chainflip";
+import {
+  chainflipTokenOf,
+  egressFor,
+  SOURCE_CONFIG_BY_ID,
+  SourceMinimumNotMetError,
+  type ChainflipToken,
+} from "@getsome/chainflip";
 import type { RefundKey } from "@getsome/ephemeral";
 import {
   createManualRail,
-  manualSourceIdOf,
   NoCashTransferError,
   PERMILL,
   PSM_EXTERNAL,
@@ -38,6 +45,7 @@ import {
   createFakeMeldClient,
   createMeldClient,
   createMeldRail,
+  ensureMeldAssets,
   pickBestQuote,
   shareStatusReads,
   type MeldClientLike,
@@ -55,8 +63,13 @@ import {
   type SupportedCountry,
 } from "~~/lib/supported";
 import { requestRefKey, requestRefOf, type RequestRef } from "../utils/request-index";
-import { estimateSourceAmount, estimateSourceFromCash } from "~~/lib/demo-rates";
-import { priceSourceLeg, type SourcePriceResult } from "~~/lib/source-price";
+import { estimateSourceFromCash } from "~~/lib/demo-rates";
+import {
+  priceSourceLeg,
+  sourceMinimumOf,
+  sourcePriceOf,
+  type SourcePriceResult,
+} from "~~/lib/source-price";
 import {
   createMockCoinageSession,
   depositTokenOf,
@@ -89,11 +102,6 @@ export { DEPOSIT_EXPIRED_REASON } from "../funding/requests/model";
 
 /** Stand-in address for the mock world, which never touches a chain. */
 const DEV_RECIPIENT = "13ENScfFZXQ8avXf6cphack516B8YCjdL4MJbodm7VxK8GE9";
-
-/** The deposit token as the Chainflip pricing and floors read it; undefined for a token Chainflip
- *  cannot deliver, such as USDC, which prices nothing through it. */
-const chainflipTokenOf = (token: TokenSpec): ChainflipToken | undefined =>
-  token.chainflipAsset === undefined ? undefined : (token as ChainflipToken);
 
 /** The deposit token as Meld delivers it. Throws for a token Meld cannot deliver. */
 function meldTokenOf(token: TokenSpec): Parameters<typeof createMeldRail>[0]["token"] {
@@ -345,6 +353,9 @@ export const useSessionStore = defineStore("session", () => {
   const meldCountry = ref<string | null>(null);
   const quoted = shallowRef<QuotedView | null>(null);
   const quoteError = ref<string | null>(null);
+  /** Quote failures in a row for one amount, method, region and source: the screens stop offering
+   *  another try after the second. Changing any of those starts the count over. */
+  const quoteFailures = ref(0);
   /** True when the selected card or bank method is not routed for the chosen region. Not a quote
    *  failure; nothing to retry. */
   const meldMethodUnavailable = ref(false);
@@ -354,8 +365,8 @@ export const useSessionStore = defineStore("session", () => {
    *  exists and so before a route can be chosen, so it assumes the PSM tier's external rather than
    *  the fallback's. A route that comes back `pool` — the PSM paused, at its ceiling, or below its
    *  minimum — moves it to the native and the watch below reloads. Off-host there is no PSM. */
-  const meldDestination = ref<string>(
-    isHosted() ? TOKENS[PSM_EXTERNAL].meldCurrencyCode : DEFAULT_MELD_DESTINATION,
+  const meldDestination = ref<MeldAssetId>(
+    (isHosted() ? TOKENS[PSM_EXTERNAL].meldAsset : undefined) ?? DEFAULT_MELD_DESTINATION,
   );
   /** Every Meld on-ramp country from the adapter's live catalog; null until loaded. */
   const supportedCountries = ref<SupportedCountry[] | null>(null);
@@ -499,6 +510,7 @@ export const useSessionStore = defineStore("session", () => {
     quoted.value = null;
     sourcePrice.value = null;
     quoteError.value = null;
+    quoteFailures.value = 0;
     meldMethodUnavailable.value = false;
   }
 
@@ -508,6 +520,7 @@ export const useSessionStore = defineStore("session", () => {
     method.value = next;
     quoted.value = null;
     quoteError.value = null;
+    quoteFailures.value = 0;
     meldMethodUnavailable.value = false;
   }
 
@@ -517,6 +530,7 @@ export const useSessionStore = defineStore("session", () => {
     meldCountry.value = code;
     quoted.value = null;
     quoteError.value = null;
+    quoteFailures.value = 0;
     meldMethodUnavailable.value = false;
   }
 
@@ -687,8 +701,8 @@ export const useSessionStore = defineStore("session", () => {
     // against one destination and quoted against another is how a supported region yields an
     // unquotable request, so the dropdown follows the route rather than a constant. A token Meld
     // cannot deliver leaves it as it was.
-    const code = depositTokenOf(route).meldCurrencyCode;
-    if (code !== undefined) meldDestination.value = code;
+    const asset = depositTokenOf(route).meldAsset;
+    if (asset !== undefined) meldDestination.value = asset;
     return route;
   }
 
@@ -770,10 +784,13 @@ export const useSessionStore = defineStore("session", () => {
           ...(redirectUrl ? { redirectUrl } : {}),
         })
       : createFakeMeldClient();
+    // The quote and the session below name Meld's code for the deposit token.
+    await ensureMeldAssets(baseClient);
     // Core's status poll (the rail) and the store's poll read the same id; they share each read.
     const statusReads = shareStatusReads(baseClient);
     // Capture the funding-request id on create so the pay sheet can poll this payment's status.
     const meldClient: MeldClientLike = {
+      getAssets: () => baseClient.getAssets(),
       getQuote: (r) => baseClient.getQuote(r),
       createSession: async (r) => {
         const s = await baseClient.createSession(r);
@@ -857,6 +874,13 @@ export const useSessionStore = defineStore("session", () => {
     });
   }
 
+  /** A quote that could not be had: the message for the screen, and one more failure in a row. */
+  function failQuote(message: string): void {
+    quoted.value = null;
+    quoteError.value = message;
+    quoteFailures.value += 1;
+  }
+
   /** (Re)quotes the Meld rail for the current CASH amount and region. The mock world simulates
    *  settlement through the harness; the hosted world runs the rail over the real host seams. */
   function fetchMeldQuote(): Promise<void> {
@@ -911,7 +935,7 @@ export const useSessionStore = defineStore("session", () => {
         );
         if (epoch !== quoteEpoch) return;
         if (quotedBudget === null) {
-          quoteError.value = "No provider offers this payment method or region. Try another.";
+          failQuote("No provider offers this payment method or region. Try another.");
           return;
         }
         const nativeBudget = quotedBudget + sizing.keepNativeForFees;
@@ -933,6 +957,7 @@ export const useSessionStore = defineStore("session", () => {
         }
         mock.value = world;
         quoted.value = meldQuotedView(quote.raw as MeldQuoteRaw, world.fundingSizing);
+        quoteFailures.value = 0;
         return;
       }
       // Hosted world: the same rail over the real host seams. The provider delivers the route's
@@ -963,13 +988,13 @@ export const useSessionStore = defineStore("session", () => {
       }
       live.value = world;
       quoted.value = meldQuotedView(quote.raw as MeldQuoteRaw, world.fundingSizing);
+      quoteFailures.value = 0;
     } catch (e: unknown) {
       if (epoch !== quoteEpoch) return; // a newer quote owns the state now
       // The host logger renders an Error as `{}`; log the message, as the transient
       // hooks above already do, or a failed quote is undiagnosable from a device log.
       console.error(`[meld] quote failed: ${e instanceof Error ? e.message : String(e)}`);
-      quoted.value = null;
-      quoteError.value = e instanceof Error ? e.message : String(e);
+      failQuote(e instanceof Error ? e.message : String(e));
     } finally {
       if (epoch === quoteEpoch) loading.value = false;
     }
@@ -985,6 +1010,10 @@ export const useSessionStore = defineStore("session", () => {
 
   async function runQuote(chain: string, asset: string, isRetry: boolean): Promise<void> {
     teardownWorld();
+    // Another source is another quote: its failures are its own.
+    if (lastQuoteParams?.chain !== chain || lastQuoteParams.asset !== asset) {
+      quoteFailures.value = 0;
+    }
     lastQuoteParams = { chain, asset };
     const epoch = quoteEpoch;
     quoteError.value = null;
@@ -998,10 +1027,13 @@ export const useSessionStore = defineStore("session", () => {
       `[coinage] quoting in the ${isHosted() ? "LIVE (hosted)" : "MOCK (browser)"} world`,
     );
     try {
-      // A direct Polkadot pick names the token it deposits; a demo Chainflip pick leaves the
-      // route to the amount. Either way the world runs under the source of the token the route
-      // has the buyer deposit.
+      // A direct Polkadot pick names the token it deposits; a Chainflip pick leaves the route to
+      // the amount. Either way the world runs under the pick's own source.
       const sourceId = sourceIdFor(chain, asset);
+      if (!sourceId) {
+        loading.value = false;
+        return;
+      }
       const direct = isDirectSourceId(sourceId) ? sourceId : null;
       const route = await chooseQuoteRoute(
         amountBase.value,
@@ -1010,11 +1042,10 @@ export const useSessionStore = defineStore("session", () => {
       if (epoch !== quoteEpoch) return;
       if (isHosted()) {
         const { nextHostedTradeNumber } = await import("~~/lib/coinage-live");
-        const liveSourceId: SourceId = manualSourceIdOf(depositTokenOf(route));
         const tradeN = await step(
           "trade number",
           10_000,
-          nextHostedTradeNumber(liveSourceId, (n) => requests.hasTrace(liveSourceId, n)),
+          nextHostedTradeNumber(sourceId, (n) => requests.hasTrace(sourceId, n)),
         );
         const world = await createLiveWorld(
           epoch,
@@ -1022,36 +1053,56 @@ export const useSessionStore = defineStore("session", () => {
           route,
           tradeN,
           undefined,
-          liveSourceId,
+          sourceId,
         );
         if (!world) return; // superseded by a newer quote
         if (epoch !== quoteEpoch) {
           world.dispose();
           return;
         }
-        const quote = await step("quote", 20_000, world.session.quote());
+        let quote: Quote;
+        const depositToken = chainflipTokenOf(depositTokenOf(route));
+        try {
+          quote = await step("quote", 20_000, world.session.quote());
+        } catch (e) {
+          // Chainflip can refuse, on a floor or an outage: the world and its burner are let go.
+          world.dispose();
+          if (!(e instanceof SourceMinimumNotMetError)) throw e;
+          if (epoch !== quoteEpoch) return;
+          console.info(
+            `[coinage] quote: below the ${e.assetSymbol} floor (${e.minimumFormatted} ${e.assetSymbol}); this purchase needs ${e.neededFormatted}`,
+          );
+          // Under the source's floor is not an error to show: the picker greys the row, held
+          // against the budget the world sized before Chainflip was asked, and the other sources
+          // stay open.
+          quoted.value = {
+            send: e.neededFormatted,
+            symbol: e.assetSymbol,
+            nativeAmount: depositToken === undefined ? null : world.budget,
+            ...(depositToken === undefined ? {} : { depositToken }),
+            sourceAsset: asset,
+            sourceChain: chain,
+          };
+          sourcePrice.value = { kind: "minimum", minimum: sourceMinimumOf(e) };
+          return;
+        }
         if (epoch !== quoteEpoch) {
           world.dispose();
           return;
         }
         live.value = world;
-        const depositToken = chainflipTokenOf(depositTokenOf(route));
+        quoteFailures.value = 0;
         quoted.value = {
           send: quote.source.formatted,
           symbol: quote.source.assetSymbol,
-          nativeAmount: depositToken === undefined ? null : quote.source.amount,
+          nativeAmount: depositToken === undefined ? null : world.budget,
           ...(depositToken === undefined ? {} : { depositToken }),
           sourceAsset: asset,
           sourceChain: chain,
         };
-        if (depositToken !== undefined) {
-          priceSelectedSource(chain, asset, quote.source.amount, depositToken, epoch);
-        }
+        // The rail's own figure is the pay card's price; a direct deposit has no swap to price.
+        if (direct === null) sourcePrice.value = { kind: "price", price: sourcePriceOf(quote) };
       } else {
-        if (!sourceId) {
-          loading.value = false;
-          return;
-        }
         // Real pricing outside the host: the pool leg is a public chain read over a standalone
         // WebSocket. Skipped in node test runs; falls back to demo rates when the RPC is
         // unreachable. A stable deposit has nothing to read, the fakes take it one to one.
@@ -1092,7 +1143,7 @@ export const useSessionStore = defineStore("session", () => {
                   settleAmount: settleForPricing,
                   remoteFeeBuffer: priced.remoteFeeBuffer,
                   keepNativeForFees: priced.keepNativeForFees,
-                  // A direct deposit carries the smaller headroom, as the hosted sizing does.
+                  // A direct deposit carries its own headroom, as the hosted sizing does.
                   ...(direct === null ? {} : { slippagePct: DIRECT_SLIPPAGE_PCT }),
                 }))(),
             );
@@ -1126,6 +1177,7 @@ export const useSessionStore = defineStore("session", () => {
           return;
         }
         mock.value = world;
+        quoteFailures.value = 0;
         // The fake rail returns a fixed quote regardless of source, so a Chainflip pick shows a
         // source-appropriate estimate. A direct pick shows the rail's own figure.
         const cfg = SOURCE_CONFIG_BY_ID.get(sourceId);
@@ -1159,8 +1211,7 @@ export const useSessionStore = defineStore("session", () => {
         return fetchQuote(chain, asset, true);
       }
       console.error(`[coinage] quote failed: ${e instanceof Error ? e.message : String(e)}`);
-      quoted.value = null;
-      quoteError.value = msg;
+      failQuote(msg);
     } finally {
       if (epoch === quoteEpoch) loading.value = false;
     }
@@ -1200,6 +1251,7 @@ export const useSessionStore = defineStore("session", () => {
     teardownWorld();
     loading.value = false;
     quoteError.value = null;
+    quoteFailures.value = 0;
     resuming.value = false;
     method.value = "crypto";
     // The record survives: its burner may hold funds, and the worker keeps its job.
@@ -1262,22 +1314,12 @@ export const useSessionStore = defineStore("session", () => {
       };
     }
     // A direct Polkadot pick is paid in the token the rail quoted: the figure is exact, not an
-    // estimate. A demo Chainflip pick runs under the same default source but keeps its estimate.
+    // estimate.
     const picked = lastQuoteParams
       ? sourceIdFor(lastQuoteParams.chain, lastQuoteParams.asset)
       : undefined;
     if (isDirectSourceId(picked) && quoted.value) {
       return { sourceAmount: quoted.value.send, sourceSymbol: quoted.value.symbol };
-    }
-    const state = lastState.value;
-    const deposit = state && "deposit" in state ? state.deposit : null;
-    if (live.value && deposit) {
-      const estimate = estimateSourceAmount(
-        deposit.amount,
-        depositTokenOf(live.value.route),
-        sourceSymbol,
-      );
-      if (estimate) return { sourceAmount: `≈ ${estimate}`, sourceSymbol };
     }
     if (!live.value && amountBase.value !== null) {
       const estimate = estimateSourceFromCash(amountBase.value, sourceSymbol);
@@ -1695,11 +1737,13 @@ export const useSessionStore = defineStore("session", () => {
     faucetState.value = "funding";
     void markDepositSkipped();
     try {
-      // The world's route fixes the asset the faucet sends: the one the pipeline reads the burner
-      // for.
+      // The faucet stands in for the rail: it sends the burner what the rail would deliver, in
+      // the route's token, the one the pipeline reads the burner for. A Polkadot deposit asks the
+      // burner for that figure itself and is checked against it, so it is read off the deposit,
+      // not off a world rebuilt on reopen, whose sizing may have moved with the pool.
       await fundFromFaucet({
-        address: s.deposit.address,
-        amount: s.deposit.amount,
+        address: live.value.burnerAddress,
+        amount: isDirectSourceId(live.value.sourceId) ? s.deposit.amount : live.value.budget,
         route: live.value.route,
       });
       faucetState.value = "sent";
@@ -2181,6 +2225,7 @@ export const useSessionStore = defineStore("session", () => {
     meldCountry,
     quoted,
     quoteError,
+    quoteFailures,
     meldMethodUnavailable,
     supportedCountries,
     corridorByCountry,

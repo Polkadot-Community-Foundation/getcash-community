@@ -95,7 +95,7 @@ const SESSION_REQ = {
   country: "US",
   sourceCurrencyCode: "USD",
   sourceAmount: "136.86",
-  destinationCurrencyCode: "DOT_ASSETHUB",
+  destinationCurrencyCode: "DOT",
   destinationAmount: "153.5",
   walletAddress: "13ENScfFZXQ8avXf6cphack516B8YCjdL4MJbodm7VxK8GE9",
   paymentMethodType: "CREDIT_DEBIT_CARD",
@@ -139,7 +139,7 @@ describe("createMeldClient quote mapping", () => {
   const QUOTE_REQ = {
     country: "GB",
     sourceCurrencyCode: "GBP",
-    destinationCurrencyCode: "DOT_ASSETHUB",
+    destinationCurrencyCode: "DOT",
     sourceAmount: "50.00",
     paymentMethodType: "CREDIT_DEBIT_CARD",
   };
@@ -223,11 +223,55 @@ describe("createMeldClient error mapping", () => {
       client.getQuote({
         country: "US",
         sourceCurrencyCode: "USD",
-        destinationCurrencyCode: "DOT_ASSETHUB",
+        destinationCurrencyCode: "DOT",
         sourceAmount: "1.00",
         paymentMethodType: "CREDIT_DEBIT_CARD",
       }),
     ).rejects.toThrow(/5\.00 USD/);
+  });
+
+  it("names the asked region on BelowMinimum, since the geo default picked it", async () => {
+    const { impl } = stubFetch(400, {
+      error: { tag: "BelowMinimum", value: { amount: "5.00", currency: "USD" } },
+    });
+    const client = createMeldClient({ baseUrl: "https://adapter.test", fetchImpl: impl });
+    await expect(
+      client.getQuote({
+        country: "US",
+        sourceCurrencyCode: "USD",
+        destinationCurrencyCode: "DOT",
+        sourceAmount: "1.00",
+        paymentMethodType: "CREDIT_DEBIT_CARD",
+      }),
+    ).rejects.toThrow(/your region \(United States\)/);
+  });
+
+  it("names the asked region on RegionUnavailable", async () => {
+    const { impl } = stubFetch(400, { error: { tag: "RegionUnavailable" } });
+    const client = createMeldClient({ baseUrl: "https://adapter.test", fetchImpl: impl });
+    await expect(
+      client.getQuote({
+        country: "DE",
+        sourceCurrencyCode: "EUR",
+        destinationCurrencyCode: "DOT",
+        sourceAmount: "50.00",
+        paymentMethodType: "CREDIT_DEBIT_CARD",
+      }),
+    ).rejects.toThrow(/Not available in your region \(Germany\) yet\./);
+  });
+
+  it("names a region Intl cannot, by its own code", async () => {
+    const { impl } = stubFetch(400, { error: { tag: "RegionUnavailable" } });
+    const client = createMeldClient({ baseUrl: "https://adapter.test", fetchImpl: impl });
+    await expect(
+      client.getQuote({
+        country: "ZZ",
+        sourceCurrencyCode: "USD",
+        destinationCurrencyCode: "DOT",
+        sourceAmount: "50.00",
+        paymentMethodType: "CREDIT_DEBIT_CARD",
+      }),
+    ).rejects.toThrow(/your region \(ZZ\)/);
   });
 
   it("names the failing call for a tag it does not know", async () => {
@@ -419,7 +463,7 @@ describe("createMeldClient error mapping", () => {
       { paymentMethodType: "BANK_TRANSFER" },
       { country: "DE" },
       { sourceCurrencyCode: "EUR" },
-      { destinationCurrencyCode: "USDC_ASSETHUB" },
+      { destinationCurrencyCode: "USDC_DOT" },
       { walletAddress: "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5" },
     ]) {
       expect(await keyFor(overrides), `chosen: ${JSON.stringify(overrides)}`).not.toBe(base);
@@ -599,5 +643,37 @@ describe("createMeldClient: a 429's retry-after", () => {
     const refusal = await refusalOf(rateLimited({}));
     expect(refusal?.status).toBe(429);
     expect(refusal?.retryAfterMs).toBeUndefined();
+  });
+});
+
+describe("the asset table", () => {
+  it("reads GET /assets with the dev product header, keeping the rows the app knows", async () => {
+    const { impl, calls } = stubSequence([
+      {
+        status: 200,
+        body: {
+          assets: [
+            { asset: "dot@assethub", code: "DOT", chain: "assethub", deliverable: true },
+            { asset: "xyz@nowhere", code: "XYZ", chain: "nowhere", deliverable: false },
+          ],
+        },
+      },
+    ]);
+    const client = createMeldClient({
+      baseUrl: "https://adapter.test/",
+      productId: "app.dot",
+      fetchImpl: impl,
+    });
+    expect(await client.getAssets()).toEqual([{ asset: "dot@assethub", code: "DOT" }]);
+    expect(calls[0]?.url).toBe("https://adapter.test/assets");
+    expect(new Headers(calls[0]?.init?.headers).get("x-dev-product-id")).toBe("app.dot");
+    // Bounded, so an adapter that hangs cannot hold every caller sharing the read.
+    expect(calls[0]?.init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("is a refusal when the adapter will not answer", async () => {
+    const { impl } = stubSequence([{ status: 401, body: { error: { tag: "Unauthorized" } } }]);
+    const client = createMeldClient({ baseUrl: "https://adapter.test", fetchImpl: impl });
+    await expect(client.getAssets()).rejects.toMatchObject({ status: 401 });
   });
 });

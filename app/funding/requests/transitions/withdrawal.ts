@@ -14,17 +14,28 @@
 // payment window starts when the purse is asked, not when the address is named.
 
 import type { FailureKind } from "@getsome/core";
-import { parseBaseUnits, SELL_TOKEN } from "@getsome/meld";
+import {
+  isDirectSellCode,
+  directSellToken,
+  directSellTokenOf,
+  parseBaseUnits,
+  sameSoldAsset,
+  SELL_TOKEN,
+  type MeldToken,
+} from "@getsome/meld";
+import { laneById, laneSellToken } from "@getsome/offramp";
 import {
   PAYMENT_EXPIRED_REASON,
   PAYMENT_WINDOW_MS,
   SALE_PAY_WINDOW_MS,
   SENDING_STEP_ORDER,
   isSendingStep,
+  isWithdrawalSideExit,
   paymentTaken,
   saleBeforePurse,
   withdrawalRankOf,
   type HostPayment,
+  type MeldSale,
   type MeldSaleReading,
   type Observation,
   type PaidVia,
@@ -33,6 +44,7 @@ import {
   type WithdrawalChannel,
   type WithdrawalFailure,
   type WithdrawalFailureKind,
+  type WithdrawalRailState,
   type WithdrawalRecord,
   type WithdrawalStatus,
 } from "../model";
@@ -105,11 +117,6 @@ function witnessed(record: WithdrawalRecord, patch: Partial<Witnesses>): Withdra
   return { ...record, witnesses: { ...record.witnesses, ...patch } };
 }
 
-const atSideExit = (record: WithdrawalRecord): boolean =>
-  record.status.kind === "failed" ||
-  record.status.kind === "expired" ||
-  record.status.kind === "cancelled";
-
 /** CASH on the key: completes the payment leg of a record still at rank 0, side exits included,
  *  and touches nothing past it. */
 function paidSeen(
@@ -132,7 +139,12 @@ function failed(
   at: number,
   failure: WithdrawalFailure,
 ): WithdrawalRecord {
-  const status: WithdrawalStatus = { kind: "failed", at, recoverable: failure.recoverable };
+  const status: WithdrawalStatus = {
+    kind: "failed",
+    at,
+    recoverable: failure.recoverable,
+    ...("at" in record.status ? { legAt: record.status.at } : {}),
+  };
   return { ...record, status, failure };
 }
 
@@ -173,6 +185,24 @@ function railFailureKind(kind: FailureKind): WithdrawalFailureKind {
   }
 }
 
+/** The rail's first report of each stage and of sending on, carried past later reads and the
+ *  failure that overwrites `updatedAt`. */
+function stageStamps(
+  before: WithdrawalRailState,
+  read: WithdrawalRailState,
+  at: number,
+): Pick<WithdrawalRailState, "stageAt"> {
+  const { stage, status } = read;
+  const stageAt = { ...before.stageAt };
+  if ((stage === "received" || stage === "processing") && stageAt[stage] === undefined) {
+    stageAt[stage] = at;
+  }
+  if ((status === "sending" || status === "sent") && stageAt.sending === undefined) {
+    stageAt.sending = at;
+  }
+  return Object.keys(stageAt).length === 0 ? {} : { stageAt };
+}
+
 /** The provider's word on the swap, folded onto the rail: delivered completes the request, a
  *  failure ends the rail leg, and only a refund can be tried again. */
 function railRead(
@@ -181,13 +211,26 @@ function railRead(
   at: number,
 ): WithdrawalRecord {
   if (record.rail.provider === "direct") return record;
-  const rail = mergeRail(record.rail, railFromSwapStatus(record.rail.provider, reading, at));
-  if (rail === record.rail) return record;
+  const read = mergeRail(record.rail, railFromSwapStatus(record.rail.provider, reading, at));
+  if (read === record.rail) return record;
+  const rail = { ...read, ...stageStamps(record.rail, read, at) };
   const next = { ...record, rail };
   const rank = withdrawalRankOf(next);
-  if (rail.stage === "delivered") return rank < 4 && !atSideExit(next) ? sent(next, at) : next;
+  if (rail.stage === "delivered")
+    return rank < 4 && !isWithdrawalSideExit(next) ? sent(next, at) : next;
   if (rail.stage === "failed" && rail.failure !== undefined) {
-    if (rank >= 4 || atSideExit(next)) return next;
+    if (rank >= 4 || isWithdrawalSideExit(next)) return next;
+    // A sale's swap refunds its USDT to the key, and the worker brings it home itself: nothing
+    // reached the provider, there is nothing for the seller to move, and the order cannot be
+    // tried again.
+    if (record.rail.provider === "meld" && rail.failure.kind === "refunded") {
+      return failed(next, at, {
+        kind: "sale-closed",
+        step: "send",
+        message: rail.failure.message,
+        recoverable: false,
+      });
+    }
     return failed(next, at, {
       kind: railFailureKind(rail.failure.kind),
       step: "send",
@@ -212,12 +255,15 @@ function workerWitness(job: WithdrawJobView, at: number): Witnesses["worker"] {
   };
 }
 
-/** The worker's failures that end a sale before its provider is paid, with the key going home. */
+/** The worker's failures that end a sale before its provider is paid, with the key going home. A
+ *  hold among them: a sale has one order, so the retry and the pool switch a crypto withdrawal
+ *  takes from a hold have nothing to sell for. */
 const SALE_ENDING_FAILURES: ReadonlySet<string> = new Set([
   "channel-expired",
   "channel-mismatch",
   "rejected",
   "timeout",
+  "held",
   "no-rail",
 ]);
 
@@ -241,7 +287,7 @@ function applyWorker(
   if (job.rail !== undefined) next = railRead(next, job.rail, at);
   const rank = withdrawalRankOf(next);
   if (job.phase === "failed") {
-    if (atSideExit(next)) return next;
+    if (isWithdrawalSideExit(next)) return next;
     // A sale has one order, opened once: a failure before its provider is paid ends it, and the
     // worker sends the key's funds home rather than trying the same order again.
     if (next.rail.provider === "meld" && SALE_ENDING_FAILURES.has(job.failure ?? "")) {
@@ -260,6 +306,16 @@ function applyWorker(
           kind: job.failure,
           step: rank >= 3 ? "send" : "convert",
           message: job.lastError ?? "the conversion failed in the background",
+          recoverable: true,
+        });
+      case "held":
+        // The PSM refused the redeem three times for a reason waiting cannot clear. The CASH is
+        // still on the key; a retry re-arms the worker's count.
+        if (rank < 1) return next;
+        return failed(next, at, {
+          kind: "held",
+          step: "convert",
+          message: job.lastError ?? "the PSM would not redeem the CASH",
           recoverable: true,
         });
       case "expired":
@@ -291,6 +347,16 @@ function applyWorker(
           message: job.lastError ?? "no provider can carry this withdrawal in this build",
           recoverable: false,
         });
+      case "too-small":
+        // Once the exit's fee and the account's minimum are left behind, the CASH on the key's
+        // Asset Hub account is under what any exit can take; it stays there for a person.
+        if (rank < 1) return next;
+        return failed(next, at, {
+          kind: "unknown",
+          step: "convert",
+          message: job.lastError ?? "the CASH left on the key is too small to redeem",
+          recoverable: false,
+        });
       case "unfundable":
         // The price moved past what the sale promised its provider before anything left People.
         // The worker sends the CASH home.
@@ -314,7 +380,7 @@ function applyWorker(
     }
   }
   // The worker finished following the provider: delivered, whatever its last reading said.
-  if (job.done && rank < 4 && !atSideExit(next)) return sent(next, at);
+  if (job.done && rank < 4 && !isWithdrawalSideExit(next)) return sent(next, at);
   if (job.fundsSeenAt !== null && isSendingStep(job.phase)) {
     const { status } = next;
     const laterStep =
@@ -409,7 +475,7 @@ function applySale(record: WithdrawalRecord, observation: SaleObservation): With
   // The address taken must still be the provider's word. The adapter stops naming one the
   // provider moved away from and shows the terms the provider states now, so a deposit that is
   // gone or changed ends the sale before anything is asked of the purse.
-  if (channel !== undefined && !sameDeposit(channel, reading.deposit)) {
+  if (channel !== undefined && !sameDeposit(sellTokenOf(sale), channel, reading.deposit)) {
     return failed(next, at, {
       kind: "sale-mismatch",
       step: "payment",
@@ -420,13 +486,28 @@ function applySale(record: WithdrawalRecord, observation: SaleObservation): With
   return next;
 }
 
+/** What a sale sells: its offramp lane's asset, or the Asset Hub asset it opened on, PAS unless
+ *  it names another. Read by the asset, not the code, which Meld may have renamed since; a record
+ *  from before the asset was kept falls back to its code. The code was checked when the sale
+ *  opened; this never throws. */
+export function sellTokenOf(sale: MeldSale): MeldToken {
+  if (sale.lane !== undefined) return laneSellToken(laneById(sale.lane));
+  if (sale.asset !== undefined) return directSellTokenOf(sale.asset) ?? SELL_TOKEN;
+  const code = sale.sellCode;
+  return code !== undefined && isDirectSellCode(code) ? directSellToken(code) : SELL_TOKEN;
+}
+
 /** Whether `deposit` is the channel's address, for the sale's asset and its exact amount. */
-function sameDeposit(channel: WithdrawalChannel, deposit: MeldSaleReading["deposit"]): boolean {
+function sameDeposit(
+  token: MeldToken,
+  channel: WithdrawalChannel,
+  deposit: MeldSaleReading["deposit"],
+): boolean {
   return (
     deposit !== undefined &&
     deposit.address === channel.address &&
-    deposit.currency === SELL_TOKEN.meldCurrencyCode &&
-    parseBaseUnits(SELL_TOKEN, deposit.amount) === BigInt(channel.amount ?? "0")
+    sameSoldAsset(deposit.currency, token.meldCurrencyCode) &&
+    parseBaseUnits(token, deposit.amount) === BigInt(channel.amount ?? "0")
   );
 }
 
@@ -441,9 +522,10 @@ function depositKnown(
   at: number,
 ): WithdrawalRecord {
   const sale = record.sale!;
+  const token = sellTokenOf(sale);
   const expected = BigInt(sale.cryptoAmount);
-  const asked = parseBaseUnits(SELL_TOKEN, deposit.amount);
-  if (deposit.currency !== SELL_TOKEN.meldCurrencyCode || asked !== expected) {
+  const asked = parseBaseUnits(token, deposit.amount);
+  if (!sameSoldAsset(deposit.currency, token.meldCurrencyCode) || asked !== expected) {
     return failed(record, at, {
       kind: "sale-mismatch",
       step: "payment",
@@ -489,7 +571,7 @@ function applyHost(record: WithdrawalRecord, observation: HostObservation): With
           conflict: { source: "host", note: "payment failed after CASH was seen", at },
         });
       }
-      if (atSideExit(stamped)) return stamped;
+      if (isWithdrawalSideExit(stamped)) return stamped;
       return failed(stamped, at, {
         kind: "payment-failed",
         step: "payment",
@@ -578,21 +660,35 @@ function applyUser(record: WithdrawalRecord, observation: UserObservation): With
         };
       }
       if (record.failure?.step === "send") {
-        // The PAS is back on the key: the rail leg starts over with a fresh channel.
+        // The PAS is back on the key: the rail leg starts over with a fresh channel and a fresh
+        // job, so the old job's payment and failure say nothing about it.
         return {
           ...rest,
           status: { kind: "sending", at },
           rail: { provider: record.rail.provider, stage: "waiting", updatedAt: at },
+          witnesses: { ...rest.witnesses, worker: { known: false, at } },
         };
       }
       const worker = record.witnesses.worker;
       const step: SendingStep =
         worker?.known && isSendingStep(worker.phase) ? worker.phase : "swap";
-      return { ...rest, status: { kind: "converting", at, step } };
+      if (worker?.known !== true) return { ...rest, status: { kind: "converting", at, step } };
+      // The failed attempt's ending is over with the retry; the transactions it filed still stand.
+      const { failure: _failure, lastError: _lastError, ...kept } = worker;
+      return {
+        ...rest,
+        status: { kind: "converting", at, step },
+        witnesses: { ...rest.witnesses, worker: kept },
+      };
     }
     case "channel-opened":
       // A fresh channel for the rail leg; the hand-off the worker is re-armed with carries it.
       return { ...record, handoff: { ...record.handoff, channel: observation.channel } };
+    case "swap-opened":
+      // Only before the purse is asked: a key already paying keeps the swap it was handed.
+      if (record.sale?.lane === undefined || record.payment.requestedAt !== undefined)
+        return record;
+      return { ...record, handoff: { ...record.handoff, swap: observation.channel } };
     case "sale-unfundable":
       // Only before the purse was asked: after that the worker's own floor decides.
       if (

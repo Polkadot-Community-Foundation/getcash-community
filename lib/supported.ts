@@ -8,8 +8,19 @@
 // region produces an unquotable request. Every cache is therefore keyed by destination, and by
 // direction: a sale reads Meld's off-ramp catalog, whose regions and payout methods are its own.
 
-/** The catalog's default destination: what the pool tier's rail asks Meld to deliver. */
-export const DEFAULT_MELD_DESTINATION = "DOT_ASSETHUB";
+import { isMeldAssetId, meldCodeOf, type MeldAssetId } from "@getsome/core";
+import { pageMeldAssets } from "./meld-assets";
+
+/** The catalog's default destination: what the pool tier's rail asks Meld to deliver. By the app's
+ *  name for the asset; Meld's code for it is read from the adapter when a catalog is fetched. */
+export const DEFAULT_MELD_DESTINATION: MeldAssetId = "dot@assethub";
+
+/** Meld's code for `asset`, once the page has the adapter's table. Throws when it cannot be read,
+ *  which every caller below turns into its `null`. */
+async function destinationCode(asset: MeldAssetId): Promise<string> {
+  await pageMeldAssets();
+  return meldCodeOf(asset);
+}
 
 export type SupportedMethodCategory = "card" | "bank" | "wallet" | "other";
 
@@ -23,6 +34,20 @@ export interface SupportedMethod {
   max: string;
   currency: string;
   providers: string[];
+  /** An off-ramp method only: every lane the adapter found routing it, in the adapter's order,
+   *  each with its own limits. The sale picks among them (see useMeldSellQuote). */
+  lanes?: OfframpLaneRef[];
+}
+
+/** An off-ramp lane as the adapter names it: the asset sold and Meld's code for it, its chain and
+ *  its limits. A chain other than `assethub` means the sale swaps through Chainflip first. */
+export interface OfframpLaneRef {
+  /** The app's name for the asset, from an adapter that sends one. */
+  asset?: MeldAssetId;
+  code: string;
+  chain: string;
+  min?: string;
+  max?: string;
 }
 
 /** A (country, fiat) corridor. Empty `methods` means nothing routes here. */
@@ -30,6 +55,8 @@ export interface SupportedCorridor {
   country: string;
   fiat: string;
   methods: SupportedMethod[];
+  /** The country's name, where the catalog gave one. */
+  name?: string;
 }
 
 /** One region-dropdown row. Deliverability is answered per selection by `fetchCorridor`. */
@@ -73,17 +100,16 @@ function headers(): Record<string, string> {
  *  are separate catalogs on Meld's side, with their own regions, methods and limits. */
 export type SupportedDirection = "buy" | "sell";
 
-// All three keyed by direction and destination currency code; a second destination is a second
-// catalog.
+// All three keyed by direction and destination asset; a second destination is a second catalog.
 const countriesCache = new Map<string, SupportedCountry[]>();
 const corridorCache = new Map<string, SupportedCorridor>();
 const corridorsCache = new Map<string, Map<string, SupportedCorridor>>();
 
 /** Cache key for a catalog: a buy keeps the bare destination it always had. */
-const catalogKey = (destination: string, direction: SupportedDirection) =>
+const catalogKey = (destination: MeldAssetId, direction: SupportedDirection) =>
   direction === "buy" ? destination : `sell:${destination}`;
 /** Cache key for the per-country corridor, which varies by both. */
-const corridorKey = (destination: string, country: string, direction: SupportedDirection) =>
+const corridorKey = (destination: MeldAssetId, country: string, direction: SupportedDirection) =>
   `${catalogKey(destination, direction)}:${country}`;
 /** The query tail a direction adds; a buy adds none, as the adapter's default. */
 const directionQuery = (direction: SupportedDirection) =>
@@ -101,7 +127,28 @@ function toMethod(raw: Record<string, unknown>, fiat: string): SupportedMethod {
     max: String(raw.max ?? ""),
     currency: String(raw.currency ?? fiat),
     providers: Array.isArray(raw.providers) ? raw.providers.map(String) : [],
+    ...lanesOf(raw.lanes),
   };
+}
+
+function lanesOf(raw: unknown): { lanes?: OfframpLaneRef[] } {
+  if (!Array.isArray(raw)) return {};
+  const lanes: OfframpLaneRef[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const { asset, code, chain, min, max } = entry as Record<string, unknown>;
+    if (typeof code !== "string" || code === "" || typeof chain !== "string" || chain === "") {
+      continue;
+    }
+    lanes.push({
+      ...(isMeldAssetId(asset) ? { asset } : {}),
+      code,
+      chain,
+      ...(typeof min === "string" ? { min } : {}),
+      ...(typeof max === "string" ? { max } : {}),
+    });
+  }
+  return { lanes };
 }
 
 /**
@@ -109,7 +156,7 @@ function toMethod(raw: Record<string, unknown>, fiat: string): SupportedMethod {
  * discovery is unreachable or unconfigured.
  */
 export async function fetchSupportedCountries(
-  destination: string,
+  destination: MeldAssetId,
   direction: SupportedDirection = "buy",
 ): Promise<SupportedCountry[] | null> {
   const cached = countriesCache.get(catalogKey(destination, direction));
@@ -118,7 +165,7 @@ export async function fetchSupportedCountries(
   if (base === undefined) return null;
   try {
     const res = await fetch(
-      `${base.replace(/\/$/, "")}/supported/countries?destinationCurrencyCode=${encodeURIComponent(destination)}${directionQuery(direction)}`,
+      `${base.replace(/\/$/, "")}/supported/countries?destinationCurrencyCode=${encodeURIComponent(await destinationCode(destination))}${directionQuery(direction)}`,
       { headers: headers() },
     );
     if (!res.ok) return null;
@@ -140,7 +187,7 @@ export async function fetchSupportedCountries(
  * discovery is unreachable; an empty `methods` array means nothing routes here.
  */
 export async function fetchCorridor(
-  destination: string,
+  destination: MeldAssetId,
   country: string,
   direction: SupportedDirection = "buy",
 ): Promise<SupportedCorridor | null> {
@@ -150,7 +197,7 @@ export async function fetchCorridor(
   if (base === undefined) return null;
   try {
     const res = await fetch(
-      `${base.replace(/\/$/, "")}/supported?country=${encodeURIComponent(country)}&destinationCurrencyCode=${encodeURIComponent(destination)}${directionQuery(direction)}`,
+      `${base.replace(/\/$/, "")}/supported?country=${encodeURIComponent(country)}&destinationCurrencyCode=${encodeURIComponent(await destinationCode(destination))}${directionQuery(direction)}`,
       { headers: headers() },
     );
     if (!res.ok) return null;
@@ -175,7 +222,7 @@ export async function fetchCorridor(
 
 // Every supported corridor as a country -> corridor map, DB-backed and tab-cached; null when unreachable.
 export async function fetchSupportedCorridors(
-  destination: string,
+  destination: MeldAssetId,
   direction: SupportedDirection = "buy",
 ): Promise<Map<string, SupportedCorridor> | null> {
   const cached = corridorsCache.get(catalogKey(destination, direction));
@@ -184,7 +231,7 @@ export async function fetchSupportedCorridors(
   if (base === undefined) return null;
   try {
     const res = await fetch(
-      `${base.replace(/\/$/, "")}/supported/corridors?destinationCurrencyCode=${encodeURIComponent(destination)}${directionQuery(direction)}`,
+      `${base.replace(/\/$/, "")}/supported/corridors?destinationCurrencyCode=${encodeURIComponent(await destinationCode(destination))}${directionQuery(direction)}`,
       { headers: headers() },
     );
     if (!res.ok) return null;
@@ -201,6 +248,70 @@ export async function fetchSupportedCorridors(
     // Only a non-empty result is cached; an empty one (cold cache) is retried next call.
     if (map.size > 0) corridorsCache.set(catalogKey(destination, direction), map);
     return map;
+  } catch {
+    return null;
+  }
+}
+
+// The off-ramp catalog: the adapter merges Meld's sell routes for every configured lane (today's
+// Asset Hub sale first, then the Chainflip lanes) and tags each country's payout method with the
+// first lane that routes it. A sale reads this instead of one destination's sell catalog, so a
+// region no provider buys the Asset Hub asset in still sells, through the swap.
+
+let offrampCorridors: Map<string, SupportedCorridor> | null = null;
+const offrampCorridorCache = new Map<string, SupportedCorridor>();
+
+function corridorOf(c: Record<string, unknown>, country: string): SupportedCorridor {
+  const fiat = String(c.fiat ?? "");
+  const methods = Array.isArray(c.methods) ? (c.methods as Record<string, unknown>[]) : [];
+  return {
+    country,
+    fiat,
+    methods: methods.map((m) => toMethod(m, fiat)),
+    ...(typeof c.name === "string" && c.name !== "" ? { name: c.name } : {}),
+  };
+}
+
+/** Every off-ramp corridor as a country -> corridor map, tab-cached; null when unreachable. */
+export async function fetchOfframpCorridors(): Promise<Map<string, SupportedCorridor> | null> {
+  if (offrampCorridors !== null) return offrampCorridors;
+  const base = baseUrl();
+  if (base === undefined) return null;
+  try {
+    const res = await fetch(`${base.replace(/\/$/, "")}/supported/offramp/corridors`, {
+      headers: headers(),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { corridors?: Record<string, unknown>[] };
+    const map = new Map<string, SupportedCorridor>();
+    for (const c of data.corridors ?? []) {
+      const country = String(c.country ?? "");
+      if (country !== "") map.set(country, corridorOf(c, country));
+    }
+    // Only a non-empty result is cached; an empty one (cold cache) is retried next call.
+    if (map.size > 0) offrampCorridors = map;
+    return map;
+  } catch {
+    return null;
+  }
+}
+
+/** One country's off-ramp corridor, read live. Cached per country; null when unreachable. */
+export async function fetchOfframpCorridor(country: string): Promise<SupportedCorridor | null> {
+  const hit = offrampCorridorCache.get(country);
+  if (hit !== undefined) return hit;
+  const base = baseUrl();
+  if (base === undefined) return null;
+  try {
+    const res = await fetch(
+      `${base.replace(/\/$/, "")}/supported/offramp?country=${encodeURIComponent(country)}`,
+      { headers: headers() },
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as Record<string, unknown>;
+    const corridor = corridorOf(data, String(data.country ?? country));
+    offrampCorridorCache.set(country, corridor);
+    return corridor;
   } catch {
     return null;
   }
@@ -343,4 +454,23 @@ export function methodFor(
 ): SupportedMethod | null {
   if (corridor === null) return null;
   return corridor.methods.find((m) => m.category === ui) ?? null;
+}
+
+/** The method's minimum in the corridor's fiat, or `null` when the corridor prices none. */
+export function methodMinimum(
+  corridor: SupportedCorridor | null,
+  ui: "card" | "bank",
+): { amount: string; fiat: string } | null {
+  const method = methodFor(corridor, ui);
+  if (method === null || method.min === "" || method.currency === "") return null;
+  return { amount: method.min, fiat: method.currency };
+}
+
+/** The other fiat method (bank for card, card for bank) when the corridor routes it, else null. */
+export function otherMethod(
+  corridor: SupportedCorridor | null,
+  ui: "card" | "bank",
+): "card" | "bank" | null {
+  const other = ui === "card" ? "bank" : "card";
+  return methodFor(corridor, other) === null ? null : other;
 }

@@ -14,17 +14,25 @@ export {
   type MeldCancelResult,
 } from "./client";
 export { formatBaseUnits, parseBaseUnits, toBaseUnits, type MeldToken } from "./units";
+export { ensureMeldAssets } from "./assets";
 export {
+  directSellCodes,
+  directSellToken,
+  directSellTokenOf,
   formatSellAmount,
+  isDirectSellCode,
+  isDirectUsdt,
   MELD_SELL_ENABLED,
   SALE_GONE_AFTER,
   SALE_GONE_FOR_MS,
   type SaleChannelRecord,
   saleRail,
   type SaleReadMemory,
+  sameSoldAsset,
   SELL_TOKEN,
   sellAmountOf,
   sellQuoteUsable,
+  USDT_SELL_TOKEN,
 } from "./sell";
 export { computeMeldQuote, pickBestQuote, type MeldQuoteContext, type MeldQuoteRaw } from "./quote";
 export { requestMeldDeposit, type MeldDepositChannel } from "./session";

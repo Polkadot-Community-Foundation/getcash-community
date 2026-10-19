@@ -2,6 +2,8 @@
 // against. `createMeldClient` talks to the onramp adapter service, which holds the Meld API key;
 // `createFakeMeldClient` is the offline stand-in.
 
+import { parseMeldAssets, type MeldAsset } from "@getsome/core";
+
 /** Forward-quote request. Meld quotes are source-denominated: the buyer names the fiat they pay
  *  and Meld returns the crypto delivered. `computeMeldQuote` iterates this for a reverse target. */
 export interface MeldQuoteRequest {
@@ -9,7 +11,7 @@ export interface MeldQuoteRequest {
   country: string;
   /** Fiat the user pays in, e.g. 'USD'. */
   sourceCurrencyCode: string;
-  /** Meld destination currency code, e.g. 'USDC_ASSETHUB'. */
+  /** Meld destination currency code, as the adapter's `GET /assets` names it, e.g. 'USDC_DOT'. */
   destinationCurrencyCode: string;
   /** Fiat the user pays, whole-currency decimal string (≤2 fraction digits), e.g. '20.00'. */
   sourceAmount: string;
@@ -23,7 +25,7 @@ export interface MeldQuoteRequest {
 export interface MeldSellQuoteRequest {
   /** ISO country of the seller, e.g. 'DE'. */
   country: string;
-  /** The crypto sold, e.g. 'DOT_ASSETHUB'. */
+  /** The crypto sold, as the adapter's `GET /assets` names it, e.g. 'DOT'. */
   sourceCurrencyCode: string;
   /** The crypto the seller sends, whole-token decimal string, e.g. '23.4521'. */
   sourceAmount: string;
@@ -100,7 +102,7 @@ export interface MeldSellSessionRequest {
    *  into the first. Sent only inside that key, never as a field of its own. */
   readonly orderRef: string;
   readonly country: string;
-  /** The crypto sold, e.g. 'DOT_ASSETHUB'. */
+  /** The crypto sold, as the adapter's `GET /assets` names it, e.g. 'DOT'. */
   readonly sourceCurrencyCode: string;
   /** The exact crypto committed, whole-token decimal string. The key pays exactly this. */
   readonly sourceAmount: string;
@@ -119,7 +121,7 @@ export interface MeldDepositDisclosure {
   readonly address: string;
   /** The crypto the provider expects, decimal string as disclosed. */
   readonly amount: string;
-  /** Meld's code for the asset, e.g. 'DOT_ASSETHUB'. */
+  /** Meld's code for the asset, e.g. 'DOT'. */
   readonly currency: string;
   /** When the adapter first read these terms, epoch ms. */
   readonly observedAt: number;
@@ -184,6 +186,9 @@ export interface MeldSellClientLike {
 }
 
 export interface MeldClientLike extends Partial<MeldSellClientLike> {
+  /** What Meld calls each asset the adapter serves (`GET /assets`). Read once, before any call that
+   *  names a code; see `ensureMeldAssets`. */
+  getAssets(): Promise<MeldAsset[]>;
   getQuote(req: MeldQuoteRequest): Promise<{ quotes: MeldQuoteEntry[] }>;
   createSession(req: MeldSessionRequest): Promise<MeldSessionResult>;
   getStatus(fundingRequestId: string): Promise<MeldStatusResult>;
@@ -215,21 +220,37 @@ interface TagValue {
   fundingRequestId?: string;
 }
 
+/** "your region (Germany)" when the asked country is known — the geo-detected default makes the
+ *  region worth naming — and the bare phrase when no country was on the request. */
+function regionPhrase(region?: string): string {
+  if (!region) return "your region";
+  let name: string | undefined;
+  try {
+    name = new Intl.DisplayNames(["en"], { type: "region" }).of(region) ?? undefined;
+  } catch {
+    // A malformed code names itself.
+  }
+  // ICU answers "Unknown Region" for a well-formed code it has no name for; the code says more.
+  return `your region (${name === undefined || name === "Unknown Region" ? region : name})`;
+}
+
 /** Buyer-facing copy for each adapter failure tag. Unknown tags fall back to a generic line naming
- *  the failed call, `what`. */
-function messageForTag(tag: string, value?: TagValue, what?: string): string {
+ *  the failed call, `what`; `region` is the ISO country the refused request asked for. */
+function messageForTag(tag: string, value?: TagValue, what?: string, region?: string): string {
   switch (tag) {
     case "NoQuotesAvailable":
-      return "Not available for this payment method or region. Try another method.";
+      return region
+        ? `Not available for this payment method in ${regionPhrase(region)}. Try another method.`
+        : "Not available for this payment method or region. Try another method.";
     case "RegionUnavailable":
-      return "Not available in your region yet.";
+      return `Not available in ${regionPhrase(region)} yet.`;
     case "BelowMinimum":
       return value
-        ? `Below the minimum. The minimum is ${value.amount} ${value.currency}.`
+        ? `Below the minimum. The minimum for ${regionPhrase(region)} is ${value.amount} ${value.currency}.`
         : "That amount is below the minimum.";
     case "AboveMaximum":
       return value
-        ? `Above the maximum. The maximum is ${value.amount} ${value.currency}.`
+        ? `Above the maximum. The maximum for ${regionPhrase(region)} is ${value.amount} ${value.currency}.`
         : "That amount is above the maximum.";
     case "WrongAssetOrChain":
       return "That asset isn't supported.";
@@ -277,6 +298,9 @@ function retryAfterMsOf(res: Response): number | undefined {
 /** How long a status read may take before it fails: every poller of an id waits on the same read. */
 const STATUS_TIMEOUT_MS = 10_000;
 
+/** How long the asset table read waits for the adapter before giving up; the next call asks again. */
+const ASSETS_TIMEOUT_MS = 10_000;
+
 /** How many finished attempts, concluded or cancelled, a session create walks past before
  *  giving up. */
 const MAX_ATTEMPTS = 5;
@@ -289,6 +313,8 @@ const MAX_ATTEMPTS = 5;
 interface SessionWalk {
   /** Names the failing call in the refusal copy. */
   readonly what: string;
+  /** The ISO country the request asks for, named in region-shaped refusals. */
+  readonly region: string;
   /** The default idempotency key for an attempt. A caller-supplied key bypasses it. */
   readonly key: (attempt: number) => string;
   /** The create body, without the key the walk adds. */
@@ -394,7 +420,11 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
    * Parses the adapter's JSON body. On a non-OK response, maps `{ error: { tag, value } }` to an
    * AdapterRefusal with a buyer-facing message.
    */
-  async function read(res: Response, what: string): Promise<Record<string, unknown>> {
+  async function read(
+    res: Response,
+    what: string,
+    region?: string,
+  ): Promise<Record<string, unknown>> {
     const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (!res.ok) {
       const err = data["error"] as { tag?: string; value?: TagValue } | string | undefined;
@@ -404,7 +434,7 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
         `[meld] ${what} failed: ${res.status} ${tag}${value ? ` ${JSON.stringify(value)}` : ""}`,
       );
       throw new AdapterRefusal(
-        messageForTag(tag, value, what),
+        messageForTag(tag, value, what, region),
         res.status,
         typeof value === "object" && value !== null && "code" in value
           ? String(value.code)
@@ -417,13 +447,18 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
     return data;
   }
 
-  async function post(path: string, body: unknown, what: string): Promise<Record<string, unknown>> {
+  async function post(
+    path: string,
+    body: unknown,
+    what: string,
+    region?: string,
+  ): Promise<Record<string, unknown>> {
     const res = await doFetch(`${base}${path}`, {
       method: "POST",
       headers: { ...headers(), "content-type": "application/json" },
       body: JSON.stringify(body),
     });
-    return read(res, what);
+    return read(res, what, region);
   }
 
   /** Fetches `GET /funding/:id` and maps the adapter's funding record onto MeldStatusResult. */
@@ -517,6 +552,7 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
           "/session",
           { idempotencyKey: externalSessionId, ...walk.body() },
           walk.what,
+          walk.region,
         );
         const fundingRequestId = String(data.fundingRequestId ?? "");
         if (!fundingRequestId) {
@@ -604,6 +640,7 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
           paymentMethodType: req.paymentMethodType,
         },
         "The quote",
+        req.country,
       );
       const raw = (data.quotes as Record<string, unknown>[] | undefined) ?? [];
       return { quotes: toQuoteEntries(raw) };
@@ -625,6 +662,7 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
           paymentMethodType: req.paymentMethodType,
         },
         "The quote",
+        req.country,
       );
       const raw = (data.quotes as Record<string, unknown>[] | undefined) ?? [];
       return { quotes: toQuoteEntries(raw) };
@@ -633,6 +671,7 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
     async createSession(req) {
       return openSession({
         what: "Starting the payment",
+        region: req.country,
         key: (attempt) => intentKey(req, attempt),
         body: () => ({
           country: req.country,
@@ -651,19 +690,19 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
           ["destinationCurrencyCode", found.destinationCurrencyCode, req.destinationCurrencyCode],
         ],
         askedAmount: req.sourceAmount,
-        mismatchMessage:
-          "We found a payment for a different order. Contact support before starting another.",
+        mismatchMessage: "We found a payment for a different order. Do not start another.",
         reopenedMessage:
-          "This purchase is already open and can no longer be paid here. Contact support with your reference. Do not start another.",
+          "This purchase is already open and can no longer be paid here. Do not start another.",
         noSurfaceMessage: (fundingRequestId) =>
           `[meld] the adapter returned no pay page for funding request ${fundingRequestId}; there is nothing for the buyer to pay on`,
-        exhaustedMessage: `This purchase has already been opened and closed ${MAX_ATTEMPTS} times. If you are expecting funds that have not arrived, contact support with your wallet address. Starting another will not help.`,
+        exhaustedMessage: `This purchase has already been opened and closed ${MAX_ATTEMPTS} times. Starting another will not help.`,
       });
     },
 
     async createSellSession(req) {
       return openSession({
         what: "Starting the sale",
+        region: req.country,
         key: (attempt) => sellIntentKey(req, attempt),
         body: () => ({
           direction: "sell",
@@ -683,8 +722,7 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
           ["destinationCurrencyCode", found.destinationCurrencyCode, req.sourceCurrencyCode],
           ["cryptoAmount", found.cryptoAmount, req.sourceAmount],
         ],
-        mismatchMessage:
-          "We found a sale for a different order. Contact support before starting another.",
+        mismatchMessage: "We found a sale for a different order. Do not start another.",
         reopenedMessage:
           "This sale is already open and can no longer be continued here. Nothing was sent. Start a new withdrawal.",
         noSurfaceMessage: (fundingRequestId) =>
@@ -694,6 +732,16 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
     },
 
     getStatus: getFundingStatus,
+
+    async getAssets(): Promise<MeldAsset[]> {
+      // Bounded like the status read: every caller shares this one read, so an adapter that hangs
+      // rather than refusing must not hold them until the browser drops the socket.
+      const res = await doFetch(`${base}/assets`, {
+        headers: headers(),
+        signal: AbortSignal.timeout(ASSETS_TIMEOUT_MS),
+      });
+      return parseMeldAssets(await read(res, "The asset table"));
+    },
 
     async cancel(fundingRequestId): Promise<MeldCancelResult> {
       try {
