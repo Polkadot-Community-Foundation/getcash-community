@@ -17,6 +17,11 @@ vi.mock("../lib/source-floors", async (importOriginal) => ({
 
 const hosted = { value: false };
 vi.mock("../lib/host-account", () => ({ isHosted: () => hosted.value }));
+// A hosted build opens real channels only with the broker key; the tests have one.
+vi.mock("../lib/chainflip-backend", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/chainflip-backend")>()),
+  brokerConfigured: () => true,
+}));
 
 const DOT = 10_000_000_000n;
 const USDT = 1_000_000n;
@@ -168,9 +173,10 @@ describe("offers store", () => {
     const eth = offers.offeredTokens("Ethereum")[0]!.offer;
     expect(eth.state).toBe("available");
     if (eth.state !== "available") return;
-    // 100 DOT at 0.01 ETH per 25 DOT = 0.04 ETH, plus the 5% buffer.
-    expect(eth.offer.sendBaseUnits).toBe(42_000_000_000_000_000n);
-    expect(eth.offer.sendFormatted).toBe("0.042");
+    // 100 DOT at 0.01 ETH per 25 DOT = 0.04 ETH, buffered for a half-point channel:
+    // 0.04 x 1.0025 / 0.995 = 0.0403015..., shown rounded up at 6 places.
+    expect(eth.offer.sendBaseUnits).toBe(40_301_507_537_688_443n);
+    expect(eth.offer.sendFormatted).toBe("0.040302");
     expect(eth.offer.etaSeconds).toBe(600);
   });
 
@@ -218,7 +224,6 @@ describe("offers store", () => {
   it("is paused when Chainflip answered for nothing", () => {
     const session = useSessionStore();
     const offers = useOffersStore();
-    offers.demoFallback = false; // a real build
     sized(session, 100n * DOT);
     offers.floors = new Map(
       [...LEARNED.keys()].map((id) => [id, { kind: "unavailable", reason: "maintenance" }]),
@@ -226,40 +231,6 @@ describe("offers store", () => {
     expect(offers.paused).toBe(true);
     // The direct network does not depend on Chainflip.
     expect(offers.offeredNetworks.map((n) => n.chain)).toEqual(["Polkadot"]);
-  });
-
-  // TODO(production): delete with the fallback.
-  it("carries on ungated in a demo build when Chainflip answered for nothing", () => {
-    const session = useSessionStore();
-    const offers = useOffersStore();
-    offers.demoFallback = true;
-    sized(session, 100n * DOT);
-    offers.floors = new Map(
-      [...LEARNED.keys()].map((id) => [id, { kind: "unavailable", reason: "maintenance" }]),
-    );
-    expect(offers.paused).toBe(true); // still the truth about Chainflip
-    expect(offers.offeredNetworks.map((n) => n.chain)).toEqual([
-      "Polkadot",
-      "Bitcoin",
-      "Ethereum",
-      "Solana",
-      "Tron",
-    ]); // the demo proceeds with every token offered without a figure
-    expect(offers.offeredTokens("Ethereum").map((t) => t.offer.state)).toEqual([
-      "ungated",
-      "ungated",
-      "ungated",
-    ]);
-  });
-
-  it("does not let the demo fallback mask a single source Chainflip refused", () => {
-    const session = useSessionStore();
-    const offers = useOffersStore();
-    offers.demoFallback = true;
-    sized(session, 100n * DOT);
-    offers.floors = LEARNED; // only some sources unavailable: not paused
-    expect(offers.paused).toBe(false);
-    expect(offers.offeredTokens("Ethereum").map((t) => t.asset)).toEqual(["ETH", "USDT"]);
   });
 
   it("still lists every token on a network, the greyed ones included", () => {
@@ -299,7 +270,7 @@ describe("offers store", () => {
   it("greys every route while the build does not move money through Chainflip", () => {
     const session = useSessionStore();
     const offers = useOffersStore();
-    offers.railEnabled = false; // a real build before the channel rail
+    offers.railEnabled = false; // a hosted build without the broker key
     sized(session, 100n * DOT);
     // Nothing is ever learned in this build; the swap rows still say so.
     expect(offers.awaitingNetworks).toBe(false);
@@ -336,8 +307,8 @@ describe("offers store", () => {
     ]);
     const eth = offers.offeredTokens("Ethereum")[0]!.offer;
     expect(eth.state).toBe("available");
-    // 50 USDT at 0.01 ETH per 25 USDT = 0.02 ETH, plus the 5% buffer.
-    if (eth.state === "available") expect(eth.offer.sendBaseUnits).toBe(21_000_000_000_000_000n);
+    // 50 USDT at 0.01 ETH per 25 USDT = 0.02 ETH, buffered for a half-point channel.
+    if (eth.state === "available") expect(eth.offer.sendBaseUnits).toBe(20_150_753_768_844_222n);
     const btc = offers.networks.find((n) => n.chain === "Bitcoin")!.tokens[0]!.offer;
     // 50 CASH bought 50 USDT and the floor is worth 160 USDT: the smallest purchase is 160 CASH.
     expect(btc).toEqual({ state: "too-small", minimumCashBase: 160_000_000n });
@@ -399,5 +370,38 @@ describe("offers store", () => {
     sized(session, 100n * DOT);
     await nextTick();
     expect(learnSourceFloors).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks the floors again when a quote came back under a floor the rows did not show", async () => {
+    const session = useSessionStore();
+    const offers = useOffersStore();
+    sized(session, 100n * DOT);
+    offers.floors = LEARNED;
+    const eth = () => offers.tokensOf("Ethereum").find((t) => t.asset === "ETH")!.offer.state;
+    expect(eth()).toBe("available");
+    // ETH's floor moved past this purchase since the rows learned it; Chainflip said so on the
+    // quote, and the fresh floors say so on the row.
+    const moved = new Map<SourceId, SourceFloorResult>([
+      ...LEARNED,
+      ["eth", floor("eth", 10n ** 17n, 250n)],
+    ]);
+    const fresh = Promise.resolve(moved);
+    vi.mocked(learnSourceFloors).mockReturnValueOnce(fresh);
+    session.sourcePrice = {
+      kind: "minimum",
+      minimum: {
+        minimumFormatted: "0.1",
+        assetSymbol: "ETH",
+        minimumBaseUnits: 10n ** 17n,
+        neededBaseUnits: 4n * 10n ** 16n,
+        neededFormatted: "0.04",
+      },
+    };
+    await nextTick();
+    expect(learnSourceFloors).toHaveBeenCalledWith({ egress: egressFor(TOKENS.PAS) });
+    await fresh;
+    await nextTick();
+    expect(offers.floors).toBe(moved);
+    expect(eth()).toBe("too-small");
   });
 });

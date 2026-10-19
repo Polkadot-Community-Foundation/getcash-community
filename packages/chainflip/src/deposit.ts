@@ -1,6 +1,7 @@
 // Deposit-channel opening over the Chainflip SDK.
 
 import type { DepositChannel, OpenChannelArgs } from "@getsome/core";
+import { channelSlippagePct } from "./quote";
 import type { RequestDepositAddressV2Args } from "./sdk";
 import { formatSourceAmount, type SourceConfig } from "./sources";
 
@@ -26,8 +27,8 @@ export async function requestDepositAddress(
       fillOrKillParams: {
         refundAddress: args.refundAddress,
         slippageTolerancePercent:
-          (rawQuote?.["recommendedSlippageTolerancePercent"] as string | undefined) ?? "3",
-        retryDurationMinutes: 10,
+          args.fillOrKill?.slippageTolerancePercent ?? String(channelSlippagePct(rawQuote)),
+        retryDurationMinutes: args.fillOrKill?.retryDurationMinutes ?? 10,
       },
     });
   } catch (err) {

@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { SwapSdkLike } from "./sdk";
+import { ASSET_HUB_USDT } from "./sources";
 import {
   DEFAULT_CHANNEL_LIFETIME_MS,
   openWithdrawChannel,
@@ -12,6 +13,7 @@ import {
 const KEY_ON_ASSET_HUB = "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5";
 const BTC_ADDRESS = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 const FOUR_DOT = 40_000_000_000n;
+const TWENTY_USDT = 20_000_000n;
 
 const REGULAR = {
   type: "REGULAR",
@@ -77,6 +79,33 @@ describe("the outgoing channel", () => {
     ]);
   });
 
+  it("quotes USDT on Asset Hub when the withdrawal lands that on its key", async () => {
+    const { sdk, asked } = scripted();
+    const quote = await quoteOutgoing(sdk, TWENTY_USDT, destination, ASSET_HUB_USDT);
+    expect(asked.quote).toEqual({
+      srcChain: "Assethub",
+      srcAsset: "USDT",
+      destChain: "Bitcoin",
+      destAsset: "BTC",
+      amount: "20000000",
+    });
+    expect(quote.egressAmount).toBe(123_456n);
+  });
+
+  it("opens a USDT-sourced channel with a quote for USDT", async () => {
+    const { sdk, asked } = scripted();
+    const channel = await openWithdrawChannel({
+      sdk,
+      amount: TWENTY_USDT,
+      source: ASSET_HUB_USDT,
+      destination,
+      refundAddress: KEY_ON_ASSET_HUB,
+    });
+    expect(asked.quote).toMatchObject({ srcAsset: "USDT", amount: "20000000" });
+    expect(asked.channel).toMatchObject({ quote: REGULAR, destAddress: BTC_ADDRESS });
+    expect(channel.id).toBe("42");
+  });
+
   it("opens the channel with that quote, refunding to the key, paying the user", async () => {
     const { sdk, asked } = scripted();
     const channel = await openWithdrawChannel({
@@ -139,5 +168,55 @@ describe("the outgoing channel", () => {
         refundAddress: KEY_ON_ASSET_HUB,
       }),
     ).rejects.toThrow(/no BTC quote/);
+  });
+
+  it("sells Asset Hub USDT to a lane key at the slippage the sale committed to", async () => {
+    const { sdk, asked } = scripted();
+    const solanaKey = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+    await openWithdrawChannel({
+      sdk,
+      source: ASSET_HUB_USDT,
+      amount: 99_900_000n,
+      destination: { chain: "Solana", asset: "USDT", address: solanaKey },
+      refundAddress: KEY_ON_ASSET_HUB,
+      fillOrKill: { slippageTolerancePercent: "0.3", retryDurationMinutes: 30 },
+    });
+    expect(asked.quote).toEqual({
+      srcChain: "Assethub",
+      srcAsset: "USDT",
+      destChain: "Solana",
+      destAsset: "USDT",
+      amount: "99900000",
+    });
+    expect(asked.channel).toEqual({
+      quote: REGULAR,
+      destAddress: solanaKey,
+      fillOrKillParams: {
+        refundAddress: KEY_ON_ASSET_HUB,
+        slippageTolerancePercent: "0.3",
+        retryDurationMinutes: 30,
+      },
+    });
+  });
+
+  it("names the source asset when Chainflip cannot quote it", async () => {
+    await expect(
+      quoteOutgoing(scripted([]).sdk, 1n, { chain: "Solana", asset: "USDT" }, ASSET_HUB_USDT),
+    ).rejects.toThrow(/no USDT quote for 1 USDT/);
+  });
+
+  it("reads the destination's delivery fee off the quote, or 0 when it is not itemised", async () => {
+    const withFee = {
+      ...REGULAR,
+      includedFees: [
+        { type: "NETWORK", amount: "248995" },
+        { type: "EGRESS", amount: "25124" },
+      ],
+    };
+    expect((await quoteOutgoing(scripted([withFee]).sdk, 1n, destination)).egressFee).toBe(25_124n);
+    const unitemised = { ...REGULAR, includedFees: [] };
+    expect((await quoteOutgoing(scripted([unitemised]).sdk, 1n, destination)).egressFee).toBe(0n);
+    const garbled = { ...REGULAR, includedFees: [{ type: "EGRESS", amount: "n/a" }] };
+    expect((await quoteOutgoing(scripted([garbled]).sdk, 1n, destination)).egressFee).toBe(0n);
   });
 });

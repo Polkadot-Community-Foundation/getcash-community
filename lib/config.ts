@@ -1,4 +1,4 @@
-import type { SourceId, TokenSpec } from "@getsome/core";
+import { isMeldAssetId, type MeldAssetId, type SourceId, type TokenSpec } from "@getsome/core";
 import {
   directAssetName,
   isManualSourceId,
@@ -65,11 +65,6 @@ export type FundingChain = (typeof FUNDING_CHAINS)[number];
 
 // The destination is always CASH; this app has no other destination assets.
 
-/** Whether this build moves money through Chainflip. Off until the channel rail lands: the
- *  pickers keep listing the Chainflip routes, greyed and named as not yet available, so nothing
- *  can reach a deposit or a withdrawal that would have nowhere to go. */
-export const CHAINFLIP_RAIL_ENABLED = false;
-
 /** Whether this build sells CASH for fiat through Meld. Owned by the Meld package so the worker
  *  holds the same line the page does. */
 export { MELD_SELL_ENABLED } from "@getsome/meld";
@@ -134,3 +129,26 @@ const PAIR_BY_SOURCE_ID: ReadonlyMap<string, { chain: string; asset: string }> =
 /** The UI pair a source id names, in either catalog; undefined for a Meld or unknown id. */
 export const sourcePairFor = (sourceId: string): { chain: string; asset: string } | undefined =>
   PAIR_BY_SOURCE_ID.get(sourceId);
+
+/** The off-ramp lanes this build sells through, in preference order, by the app's name for each
+ *  asset (`usdt@assethub`), never by Meld's code for it, which the adapter owns and Meld renames.
+ *  By default only the direct Asset Hub sales, USDT before DOT since the PSM redeems the CASH for
+ *  USDT at a fixed rate where DOT takes the pool's price. The Chainflip swap lanes (usdc@arbitrum,
+ *  usdc@solana) are opt-in: a build sells through one only when VITE_OFFRAMP_LANES names it.
+ *  VITE_OFFRAMP_LANES overrides the list, comma separated; an asset left out is not offered,
+ *  whatever the adapter lists, and an entry that is not an asset id is dropped with a warning. */
+export const OFFRAMP_LANE_ORDER: readonly MeldAssetId[] = (() => {
+  const raw = import.meta.env.VITE_OFFRAMP_LANES as string | undefined;
+  const listed = (raw ?? "")
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry !== "");
+  const unknown = listed.filter((entry) => !isMeldAssetId(entry));
+  if (unknown.length > 0) {
+    console.warn(
+      `[config] VITE_OFFRAMP_LANES names ${unknown.join(", ")}, which are not asset ids (e.g. usdt@assethub); ignored`,
+    );
+  }
+  const assets = listed.filter(isMeldAssetId);
+  return assets.length > 0 ? assets : ["usdt@assethub", "dot@assethub"];
+})();

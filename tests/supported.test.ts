@@ -3,10 +3,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SupportedCorridor } from "../lib/supported";
+import { installTestMeldAssets } from "./setup-meld-assets";
 
-/** The catalog is keyed by destination; these cases all read the pool tier's.
- *  See lib/supported.ts. */
-const DEST = "DOT_ASSETHUB";
+/** The catalog is keyed by destination asset; these cases all read the pool tier's, which Meld
+ *  calls DOT. See lib/supported.ts. */
+const DEST = "dot@assethub";
 
 const BASE = "https://adapter.test";
 
@@ -27,8 +28,9 @@ function stubFetch(routes: Record<string, unknown>) {
 }
 
 describe("lib/supported", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
+    await installTestMeldAssets();
     vi.stubEnv("VITE_MELD_BASE_URL", BASE);
   });
   afterEach(() => {
@@ -64,6 +66,50 @@ describe("lib/supported", () => {
     expect(methodFor(corridor, "bank")?.paymentMethodType).toBe("ACH");
     expect(methodFor({ country: "X", fiat: "Y", methods: [] }, "card")).toBeNull();
     expect(methodFor(null, "card")).toBeNull();
+  });
+
+  it("otherMethod names the other fiat method only when the corridor routes it", async () => {
+    const { otherMethod } = await import("../lib/supported");
+    const card = {
+      paymentMethodType: "CREDIT_DEBIT_CARD",
+      category: "card" as const,
+      min: "26",
+      max: "5000",
+      currency: "BRL",
+      providers: ["TRANSAK"],
+    };
+    const cardOnly: SupportedCorridor = { country: "BR", fiat: "BRL", methods: [card] };
+    expect(otherMethod(cardOnly, "bank")).toBe("card");
+    expect(otherMethod(cardOnly, "card")).toBeNull();
+    expect(otherMethod({ country: "EC", fiat: "USD", methods: [] }, "bank")).toBeNull();
+    expect(otherMethod(null, "bank")).toBeNull();
+  });
+
+  it("asks for a destination under the code the adapter's table names it by", async () => {
+    const fetchSpy = stubFetch({
+      "/supported/countries": { countries: [{ country: "US", name: "US" }] },
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    const { fetchSupportedCountries } = await import("../lib/supported");
+    await fetchSupportedCountries(DEST);
+    expect(String(fetchSpy.mock.calls[0]?.[0])).toContain("destinationCurrencyCode=DOT");
+  });
+
+  it("reads the table from the adapter first when the page has none, and asks nothing without it", async () => {
+    vi.resetModules();
+    const fetchSpy = stubFetch({
+      "/assets": { assets: [{ asset: "dot@assethub", code: "DOT_FROM_ADAPTER" }] },
+      "/supported/countries": { countries: [{ country: "US", name: "US" }] },
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    const { fetchSupportedCountries, fetchCorridor } = await import("../lib/supported");
+    expect(await fetchSupportedCountries(DEST)).toHaveLength(1);
+    const urls = fetchSpy.mock.calls.map(([url]) => String(url));
+    expect(urls[0]).toBe(`${BASE}/assets`);
+    expect(urls[1]).toContain("destinationCurrencyCode=DOT_FROM_ADAPTER");
+    // An asset the adapter does not serve has no code to ask under: no catalog, and no request.
+    expect(await fetchCorridor("usdt@assethub", "US")).toBeNull();
+    expect(fetchSpy.mock.calls).toHaveLength(2);
   });
 
   it("fetchCorridor parses methods, and returns null when the adapter has no such corridor", async () => {
@@ -434,5 +480,82 @@ describe("lib/supported", () => {
     // No pin, and the search's answer leads without a heading; the reasons keep theirs.
     expect(groups.map((g) => g.title)).toEqual([null, "Unsupported country"]);
     expect(groups[0]?.rows.map((r) => r.country)).toEqual(["GB"]);
+  });
+
+  it("reads the off-ramp catalog with each method's lane, and caches only a non-empty one", async () => {
+    const body = {
+      corridors: [
+        {
+          country: "DE",
+          name: "Germany",
+          fiat: "EUR",
+          methods: [
+            {
+              paymentMethodType: "SEPA",
+              category: "bank",
+              min: "20",
+              max: "5000",
+              currency: "EUR",
+              lanes: [{ code: "DOT", chain: "assethub", min: "20", max: "5000" }],
+            },
+            {
+              paymentMethodType: "PAYOUT_TO_CARD",
+              category: "card",
+              min: "10",
+              max: "2000",
+              currency: "EUR",
+              lanes: [
+                { code: "USDC_ARBITRUM", chain: "arbitrum", min: "10", max: "2000" },
+                { code: "USDC_SOLANA", chain: "solana" },
+              ],
+            },
+          ],
+        },
+        { country: "", fiat: "EUR", methods: [] },
+      ],
+    };
+    const fetchMock = stubFetch({ "/supported/offramp/corridors": body });
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchOfframpCorridors } = await import("../lib/supported");
+    const map = await fetchOfframpCorridors();
+    expect([...map!.keys()]).toEqual(["DE"]);
+    expect(map!.get("DE")).toMatchObject({ name: "Germany", fiat: "EUR" });
+    expect(map!.get("DE")!.methods.map((m) => m.lanes)).toEqual([
+      [{ code: "DOT", chain: "assethub", min: "20", max: "5000" }],
+      [
+        { code: "USDC_ARBITRUM", chain: "arbitrum", min: "10", max: "2000" },
+        { code: "USDC_SOLANA", chain: "solana" },
+      ],
+    ]);
+    await fetchOfframpCorridors();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads one country's off-ramp corridor, dropping malformed lanes", async () => {
+    vi.stubGlobal(
+      "fetch",
+      stubFetch({
+        "/supported/offramp?country=BR": {
+          country: "BR",
+          fiat: "BRL",
+          methods: [
+            {
+              paymentMethodType: "PIX",
+              category: "bank",
+              min: "5",
+              max: "900",
+              lanes: [{ code: "" }, null, { code: "USDC_SOLANA", chain: "solana" }],
+            },
+          ],
+        },
+      }),
+    );
+    const { fetchOfframpCorridor, fetchOfframpCorridors } = await import("../lib/supported");
+    const corridor = await fetchOfframpCorridor("BR");
+    expect(corridor).toMatchObject({ country: "BR", fiat: "BRL" });
+    expect(corridor!.methods[0]!.lanes).toEqual([{ code: "USDC_SOLANA", chain: "solana" }]);
+    expect(corridor!.methods[0]!.currency).toBe("BRL");
+    // An unreachable catalog is null, not empty.
+    expect(await fetchOfframpCorridors()).toBeNull();
   });
 });

@@ -1,8 +1,10 @@
 export {
   ASSET_HUB_DOT,
+  ASSET_HUB_USDT,
   SOURCES,
   SOURCE_CONFIGS,
   SOURCE_CONFIG_BY_ID,
+  assetHubSourceFor,
   formatSourceAmount,
   type SourceConfig,
 } from "./sources";
@@ -17,11 +19,16 @@ export {
   type WithdrawChannel,
 } from "./withdraw-channel";
 export {
+  CHANNEL_SLIPPAGE_FLOOR_PCT,
+  chainflipTokenOf,
+  channelSlippagePct,
   computeQuote,
   egressFor,
   pickRegularQuote,
   ON_CHAIN_OVERHEAD_PLANCKS,
+  SOURCE_BUFFER_OVER_TOLERANCE_PCT,
   SourceMinimumNotMetError,
+  withSourceBuffer,
   type ChainflipToken,
   type EgressConfig,
   type QuoteBackend,
