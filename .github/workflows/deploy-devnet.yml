@@ -1,0 +1,74 @@
+name: Deploy (devnet)
+
+# PCF devnet: a dispatch on `devnet` publishes `getcash.dot` on the pad `devnet` environment
+# (Paseo AH 1000 / People 1004 / Bulletin 1010), then tags the deployed commit
+# `devnet/<YYYY-MM-DD>.<n>`. A dispatch on a `devnet/*` tag redeploys that tag (rollback).
+# A dispatch on any other ref only builds the site as a run artifact.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Deploys write on-chain records. They queue and are never cancelled mid-flight.
+concurrency:
+  group: deploy-devnet
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build + gates
+    runs-on: ubuntu-latest
+    environment: devnet
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/build-site
+        with:
+          faucet-seed: ${{ secrets.VITE_FAUCET_SEED }}
+          chainflip-broker-api-key: ${{ secrets.VITE_CHAINFLIP_BROKER_API_KEY }}
+          meld-base-url: ${{ secrets.VITE_MELD_BASE_URL }}
+          meld-product-id: ${{ secrets.VITE_MELD_PRODUCT_ID }}
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/devnet' || startsWith(github.ref, 'refs/tags/devnet/')
+    name: getcash (devnet)
+    runs-on: ubuntu-latest
+    environment: devnet
+    permissions:
+      contents: read
+    steps:
+      # The manifest and worker record come from bulletin-deploy.config.ts in the checkout.
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/deploy-site
+        with:
+          domain: getcash.dot
+          env: devnet
+          # Owner of getcash.dot (5Fk8…).
+          mnemonic: ${{ secrets.MNEMONIC }}
+
+  tag:
+    needs: deploy
+    if: github.ref == 'refs/heads/devnet'
+    name: Tag the deployed commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Tag the deployed commit
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y-%m-%d)
+          LAST=$(git ls-remote --tags origin "refs/tags/devnet/${DATE}.*" \
+            | sed -n "s#.*refs/tags/devnet/${DATE}\.\([0-9]*\)\$#\1#p" | sort -n | tail -1)
+          TAG="devnet/${DATE}.$(( ${LAST:-0} + 1 ))"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$GITHUB_SHA" -m "getcash.dot devnet deploy, run ${GITHUB_RUN_ID}"
+          git push origin "refs/tags/$TAG"
+          echo "### Tagged \`$TAG\` at ${GITHUB_SHA:0:8}" >> "$GITHUB_STEP_SUMMARY"
