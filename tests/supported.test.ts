@@ -245,6 +245,73 @@ describe("lib/supported", () => {
     expect(await reimport.fetchSupportedCorridors(DEST)).toBeNull(); // throw -> null
   });
 
+  it("pickerBase lists the whole catalog for bank once the corridors say which rows route", async () => {
+    const { pickerBase, corridorOptions } = await import("../lib/supported");
+    const catalog = [
+      { country: "DE", name: "Germany" },
+      { country: "IN", name: "India" },
+      { country: "US", name: "United States" },
+    ];
+    const fallback = { card: [{ country: "GB", name: "United Kingdom" }], bank: [catalog[0]!] };
+    const corridors = new Map<string, SupportedCorridor>([
+      [
+        "DE",
+        {
+          country: "DE",
+          fiat: "EUR",
+          methods: [
+            { paymentMethodType: "SEPA", category: "bank", min: "", max: "", currency: "EUR" },
+          ],
+        },
+      ],
+      [
+        "IN",
+        {
+          country: "IN",
+          fiat: "INR",
+          methods: [
+            {
+              paymentMethodType: "CREDIT_DEBIT_CARD",
+              category: "card",
+              min: "",
+              max: "",
+              currency: "INR",
+            },
+          ],
+        },
+      ],
+      [
+        "US",
+        {
+          country: "US",
+          fiat: "USD",
+          methods: [
+            { paymentMethodType: "ACH", category: "bank", min: "", max: "", currency: "USD" },
+          ],
+        },
+      ],
+    ]);
+
+    // Every region is listed; one with no transfer rail is greyed, not dropped.
+    const rows = corridorOptions(
+      pickerBase("bank", catalog, corridors, fallback),
+      corridors,
+      "bank",
+    );
+    expect(rows.map((r) => [r.country, r.disabled === true])).toEqual([
+      ["DE", false],
+      ["IN", true],
+      ["US", false],
+    ]);
+    // Before the corridors are read, bank keeps to the regions known to have a rail.
+    expect(pickerBase("bank", catalog, null, fallback)).toEqual(fallback.bank);
+    expect(pickerBase("bank", catalog, new Map(), fallback)).toEqual(fallback.bank);
+    // Card lists the catalog whatever the corridors say, and each rail has its own fallback.
+    expect(pickerBase("card", catalog, null, fallback)).toEqual(catalog);
+    expect(pickerBase("card", null, corridors, fallback)).toEqual(fallback.card);
+    expect(pickerBase("bank", [], corridors, fallback)).toEqual(fallback.bank);
+  });
+
   it("corridorOptions leaves every row plain and selectable when the map is null", async () => {
     const { corridorOptions } = await import("../lib/supported");
     const rows = corridorOptions([{ country: "US", name: "United States" }], null, "card");
@@ -422,6 +489,79 @@ describe("lib/supported", () => {
     expect(corridorOptions(base, map, "card").some((r) => r.belowMinimum)).toBe(false);
     const blank = corridorOptions(base, map, "card", { fiat: "GBP", amount: "" });
     expect(blank.some((r) => r.belowMinimum)).toBe(false);
+  });
+
+  const method = (
+    category: "card" | "bank",
+    min: string,
+    max: string,
+    currency = "USD",
+    providers = ["TRANSAK"],
+  ) => ({ paymentMethodType: category, category, min, max, currency, providers });
+  const corridor = (fiat: string, ...methods: ReturnType<typeof method>[]) => ({
+    country: "DE",
+    fiat,
+    methods,
+  });
+
+  it.each([
+    {
+      name: "a method only USDT routes",
+      usdt: corridor("USD", method("card", "10", "500")),
+      pas: corridor("USD", method("bank", "20", "900")),
+      want: corridor("USD", method("card", "10", "500"), method("bank", "20", "900")),
+    },
+    {
+      name: "a method only PAS routes",
+      usdt: corridor("USD"),
+      pas: corridor("USD", method("card", "5", "300")),
+      want: corridor("USD", method("card", "5", "300")),
+    },
+    {
+      name: "both route it: the smaller minimum and the larger maximum",
+      usdt: corridor("USD", method("card", "10.5", "500")),
+      pas: corridor("USD", method("card", "9.75", "300", "USD", ["MOONPAY", "TRANSAK"])),
+      want: corridor("USD", method("card", "9.75", "500", "USD", ["TRANSAK", "MOONPAY"])),
+    },
+    {
+      name: "a bound one side does not give",
+      usdt: corridor("USD", method("card", "", "500")),
+      pas: corridor("USD", method("card", "5", "300")),
+      want: corridor("USD", method("card", "", "500")),
+    },
+    {
+      name: "different fiats: USDT's bounds where it routes the method, else PAS's",
+      usdt: corridor("USD", method("card", "10", "500")),
+      pas: corridor("EUR", method("card", "5", "900", "EUR"), method("bank", "20", "900", "EUR")),
+      want: corridor("USD", method("card", "10", "500"), method("bank", "20", "900", "EUR")),
+    },
+    {
+      name: "USDT unreachable",
+      usdt: null,
+      pas: corridor("USD", method("card", "5", "300")),
+      want: corridor("USD", method("card", "5", "300")),
+    },
+    {
+      name: "PAS unreachable",
+      usdt: corridor("USD", method("card", "10", "500")),
+      pas: null,
+      want: corridor("USD", method("card", "10", "500")),
+    },
+  ])("mergeCorridor: $name", async ({ usdt, pas, want }) => {
+    const { mergeCorridor } = await import("../lib/supported");
+    expect(mergeCorridor(usdt, pas)).toEqual(want);
+  });
+
+  it.each([
+    { name: "both answer", usdt: ["DE", "US"], pas: ["BR", "DE"], want: ["BR", "DE", "US"] },
+    { name: "USDT unreachable", usdt: null, pas: ["BR", "DE"], want: ["BR", "DE"] },
+    { name: "PAS unreachable", usdt: ["DE", "US"], pas: null, want: ["DE", "US"] },
+    { name: "neither answers", usdt: null, pas: null, want: null },
+  ])("mergeCountries: $name", async ({ usdt, pas, want }) => {
+    const { mergeCountries, countryName } = await import("../lib/supported");
+    const rows = (codes: string[] | null) =>
+      codes && codes.map((country) => ({ country, name: countryName(country) }));
+    expect(mergeCountries(rows(usdt), rows(pas))?.map((c) => c.country) ?? null).toEqual(want);
   });
 
   it("namedCountry prefers the catalog's own name, then Intl's, then the code", async () => {

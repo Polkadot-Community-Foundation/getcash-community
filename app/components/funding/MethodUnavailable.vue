@@ -1,13 +1,14 @@
 <script setup lang="ts">
 // A card or bank rail that routes nothing from the chosen region, top-up or withdrawal: the amount,
 // why, the region (still live, as one way out), the other fiat method when the region routes it,
-// and crypto.
+// and crypto. An amount the method takes but outside its limits is `AmountOutOfRange`'s.
 import { computed } from "vue";
 import { fmtFiat } from "../../utils/money";
 import CashAmount from "../ui/CashAmount.vue";
 import DetailRows from "../ui/DetailRows.vue";
 import PillButton from "../ui/PillButton.vue";
 import RegionRow from "../ui/RegionRow.vue";
+import ScreenFrame from "../ui/ScreenFrame.vue";
 import TextButton from "../ui/TextButton.vue";
 
 const props = defineProps<{
@@ -22,7 +23,11 @@ const props = defineProps<{
   /** The other fiat method, when the region routes it: the nearer way out than crypto. */
   other: "card" | "bank" | null;
 }>();
-defineEmits<{ region: []; useCrypto: []; useOther: [] }>();
+defineEmits<{
+  region: [];
+  useCrypto: [];
+  useOther: [];
+}>();
 
 const topUp = computed(() => props.direction === "top-up");
 const message = computed(
@@ -42,7 +47,7 @@ const minRows = computed(() =>
 </script>
 
 <template>
-  <div class="flex min-h-0 flex-1 flex-col">
+  <ScreenFrame>
     <div class="flex shrink-0 flex-col items-center text-center">
       <p class="text-display-xl text-fg-primary"><CashAmount :amount="amount" /></p>
       <p class="mt-1 text-body-s text-fg-error" role="alert">{{ message }}</p>
@@ -58,9 +63,11 @@ const minRows = computed(() =>
       <DetailRows :rows="minRows" />
     </div>
 
-    <div class="mt-auto mb-6 flex shrink-0 flex-col items-center gap-2">
-      <PillButton class="w-full" @click="$emit('useCrypto')">Use crypto</PillButton>
-      <TextButton v-if="other" @click="$emit('useOther')">Use {{ other }} instead</TextButton>
-    </div>
-  </div>
+    <template #actions>
+      <div class="flex flex-col items-center gap-2">
+        <PillButton class="w-full" @click="$emit('useCrypto')">Use crypto</PillButton>
+        <TextButton v-if="other" @click="$emit('useOther')">Use {{ other }} instead</TextButton>
+      </div>
+    </template>
+  </ScreenFrame>
 </template>

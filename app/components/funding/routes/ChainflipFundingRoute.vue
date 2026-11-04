@@ -5,6 +5,7 @@ import { computed, onMounted, onUnmounted } from "vue";
 import { isDemoBuild } from "../../../utils/demo";
 import { previewStage } from "../../../utils/dev-preview-stage";
 import { useChainflipHandoff } from "../../../composables/useChainflipHandoff";
+import { useScreen } from "../../../composables/useScreen";
 import { useStateDirector } from "../../../composables/useStateDirector";
 import { useVisibilityReconcile } from "../../../composables/useVisibilityReconcile";
 import type { FundingPackageEmits } from "../../../funding/handoff";
@@ -13,6 +14,7 @@ import { useFlowStore } from "../../../stores/flow";
 import { useRequestsStore } from "../../../stores/requests";
 import { useSessionStore } from "../../../stores/session";
 import RateErrorScreen from "../../ui/RateErrorScreen.vue";
+import ScreenShell from "../../ui/ScreenShell.vue";
 
 const props = defineProps<{ selection: FundingSelection }>();
 const emit = defineEmits<FundingPackageEmits>();
@@ -33,6 +35,14 @@ const { handedOff } = useChainflipHandoff(emit);
 const quoteFailed = computed(
   () => flow.screen === "entry" && session.quoteError !== null && !session.loading,
 );
+useScreen(() => {
+  if (session.resuming || quoteFailed.value) return null;
+  if (flow.screen === "journey") {
+    if (flow.confirmingCancel) return "top-up.cancel";
+    return flow.recoveringDeposit ? "top-up.recover-deposit" : "top-up.deposit";
+  }
+  return flow.step === "token" ? "top-up.token" : "top-up.network";
+});
 
 const toolbar = computed<{
   back: boolean;
@@ -119,57 +129,38 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <!-- Toolbar and screen fill the visible viewport; the app never scrolls. -->
-  <main
-    class="fixed inset-x-0 mx-auto flex w-full max-w-md flex-col overflow-hidden bg-surface-main"
-    style="
-      top: var(--vvt, 0px);
-      height: var(--vvh, 100dvh);
-      padding-top: env(safe-area-inset-top);
-      padding-bottom: env(safe-area-inset-bottom);
-    "
-  >
-    <Toolbar :title="toolbar.title" :back="toolbar.back" @back="onBack">
-      <template v-if="toolbar.trailing" #trailing>
-        <button
-          v-if="toolbar.trailing === 'skip'"
-          type="button"
-          class="rounded-medium px-4 py-3 text-label-l font-normal text-fg-primary transition-colors hover:bg-action-tertiary-hover"
-          @click="onDepositSkip"
-        >
-          Skip
-        </button>
-      </template>
-    </Toolbar>
+  <ScreenShell :title="toolbar.title" :back="toolbar.back" @back="onBack">
+    <template v-if="toolbar.trailing" #trailing>
+      <button
+        v-if="toolbar.trailing === 'skip'"
+        type="button"
+        class="rounded-medium px-4 py-3 text-label-l font-normal text-fg-primary transition-colors hover:bg-action-tertiary-hover"
+        @click="onDepositSkip"
+      >
+        Skip
+      </button>
+    </template>
 
-    <div class="flex min-h-0 flex-1 flex-col px-6 pt-6">
-      <!-- Resuming renders the deposit screen's skeleton shapes until the request is live. -->
-      <DepositScreen v-if="session.resuming" @cancel="flow.confirmingCancel = true" />
-      <RateErrorScreen
-        v-else-if="quoteFailed"
-        :failures="session.quoteFailures"
-        :crypto="false"
-        @retry="requote"
-        @change-amount="emit('changeAmount')"
+    <!-- Resuming renders the deposit screen's skeleton shapes until the request is live. -->
+    <DepositScreen v-if="session.resuming" @cancel="flow.confirmingCancel = true" />
+    <RateErrorScreen
+      v-else-if="quoteFailed"
+      :failures="session.quoteFailures"
+      :crypto="false"
+      @retry="requote"
+      @change-amount="emit('changeAmount')"
+    />
+    <template v-else>
+      <CancelTopUpScreen
+        v-if="flow.screen === 'journey' && flow.confirmingCancel"
+        @confirm="cancelTopUp"
+        @keep="flow.confirmingCancel = false"
       />
-      <template v-else>
-        <CancelTopUpScreen
-          v-if="flow.screen === 'journey' && flow.confirmingCancel"
-          @confirm="cancelTopUp"
-          @keep="flow.confirmingCancel = false"
-        />
-        <DepositScreen
-          v-else-if="flow.screen === 'journey'"
-          @cancel="flow.confirmingCancel = true"
-        />
-        <NetworkScreen
-          v-else-if="flow.step === 'network' || flow.step === 'amount' || flow.step === 'method'"
-        />
-        <TokenScreen v-else />
-      </template>
-    </div>
-
-    <!-- state-director scene label (dev/demo keys only) -->
-    <PreviewSceneLabel />
-  </main>
+      <DepositScreen v-else-if="flow.screen === 'journey'" @cancel="flow.confirmingCancel = true" />
+      <NetworkScreen
+        v-else-if="flow.step === 'network' || flow.step === 'amount' || flow.step === 'method'"
+      />
+      <TokenScreen v-else />
+    </template>
+  </ScreenShell>
 </template>

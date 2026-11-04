@@ -109,6 +109,10 @@ export interface MeldSellSessionRequest {
   /** The fiat paid out, e.g. 'EUR'. */
   readonly destinationCurrencyCode: string;
   readonly paymentMethodType: string;
+  /** The account the crypto is sent from, which the provider refunds to: the withdrawal key on
+   *  Asset Hub for a direct sale. The adapter requires it on an Asset Hub asset, and Banxa refuses
+   *  a sale without one. Absent for a sale whose crypto reaches the provider from elsewhere. */
+  readonly walletAddress?: string;
 }
 
 /**
@@ -278,10 +282,61 @@ class AdapterRefusal extends Error {
     options?: { cause?: unknown },
     /** From a 429's `retry-after`, when the response lets the browser read it. */
     readonly retryAfterMs?: number,
+    /** The fiat bound a buy quote was refused against, from a BelowMinimum/AboveMaximum that
+     *  carried one. */
+    readonly limit?: MeldFiatLimit,
+    /** The adapter's failure tag (`NoQuotesAvailable`, `Other`, …), for logs and branching. */
+    readonly tag?: string,
   ) {
     super(message, options);
     this.name = "AdapterRefusal";
   }
+}
+
+/** True when a call failed because the adapter did not answer: no response at all, which `fetch`
+ *  rejects with a `TypeError`, a 5xx (the adapter's `ProviderTimeout` when Meld did not answer
+ *  it), or a 429. A refusal the adapter answered with is not one. */
+export function isAdapterOutage(error: unknown): boolean {
+  if (error instanceof AdapterRefusal) return error.status >= 500 || error.status === 429;
+  return error instanceof TypeError;
+}
+
+/** A buy's fiat bound, as the adapter reports it on a refused quote. */
+export interface MeldFiatLimit {
+  readonly bound: "min" | "max";
+  /** Exact decimal text, in `currency` units. */
+  readonly amount: string;
+  readonly currency: string;
+}
+
+/** What the adapter said when it refused: its tag, the `Other` code under it, and the status. */
+export interface MeldRefusal {
+  readonly tag?: string;
+  readonly code?: string;
+  readonly status: number;
+}
+
+/** The adapter's refusal behind `error`, when it is one. */
+export function refusalOf(error: unknown): MeldRefusal | undefined {
+  if (!(error instanceof AdapterRefusal)) return undefined;
+  return {
+    status: error.status,
+    ...(error.tag === undefined ? {} : { tag: error.tag }),
+    ...(error.code === undefined ? {} : { code: error.code }),
+  };
+}
+
+/** The fiat bound `error` was refused against, when it is a buy quote refused on one. */
+export function fiatLimitOf(error: unknown): MeldFiatLimit | undefined {
+  return error instanceof AdapterRefusal ? error.limit : undefined;
+}
+
+function limitOf(tag: string, value?: TagValue): MeldFiatLimit | undefined {
+  const bound = tag === "BelowMinimum" ? "min" : tag === "AboveMaximum" ? "max" : undefined;
+  if (bound === undefined || value?.amount === undefined || value.currency === undefined) {
+    return undefined;
+  }
+  return { bound, amount: value.amount, currency: value.currency };
 }
 
 /** `retry-after` in milliseconds: delta-seconds or an HTTP date. Undefined when absent or unreadable
@@ -442,6 +497,8 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
         typeof value?.fundingRequestId === "string" ? value.fundingRequestId : undefined,
         undefined,
         res.status === 429 ? retryAfterMsOf(res) : undefined,
+        limitOf(tag, value),
+        tag,
       );
     }
     return data;
@@ -711,6 +768,7 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
           // The crypto leg, named as on the buy; see `getSellQuote`.
           destinationCurrencyCode: req.sourceCurrencyCode,
           cryptoAmount: req.sourceAmount,
+          ...(req.walletAddress === undefined ? {} : { walletAddress: req.walletAddress }),
           paymentMethodType: req.paymentMethodType,
           serviceProvider: req.serviceProvider,
           ...(config.redirectUrl ? { redirectUrl: config.redirectUrl } : {}),

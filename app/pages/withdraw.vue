@@ -39,6 +39,7 @@ import { previewStage, type PreviewStage } from "../utils/dev-preview-stage";
 import { useRouter } from "vue-router";
 import { WITHDRAWAL_LIST_WORDING, WITHDRAWAL_WORDING } from "../withdraw/rows";
 import { frontloadHostPermissions } from "~~/lib/host-frontload";
+import { devLog } from "~~/lib/log";
 
 useVisualViewportHeight();
 const requests = useRequestsStore();
@@ -126,7 +127,7 @@ async function openTopUp(topUp: FundingTopUp, target: FundingTopUpReturnTarget) 
     topUpError.value = `${routeLabel(topUp.route)} withdrawals aren't available in this build yet.`;
     return;
   }
-  console.error(`[withdraw] could not load ${result.packageId} status:`, result.error);
+  devLog("withdraw", `could not load ${result.packageId} status`, result.error, "error");
   topUpError.value = `${routeLabel(topUp.route)} status couldn't be opened. Try again.`;
 }
 
@@ -145,6 +146,18 @@ function returnFromTopUp() {
   topUpError.value = null;
   // The watched withdrawal may have settled; the known balance stands, so nothing flickers.
   void purse.refresh();
+}
+
+/** A package asked for another amount: back to the amount screen, the amount kept. */
+function returnToAmount() {
+  loadEpoch += 1;
+  shellEntry.value = "amount";
+  returnToShell();
+}
+
+/** The bound a package's quote named becomes the amount; the package stays up and quotes it. */
+function useAmount(amount: string) {
+  if (selection.value !== null) selection.value = { ...selection.value, amount };
 }
 
 /** Back from a fresh withdrawal's package lands on the pending list, where it now shows. */
@@ -222,12 +235,12 @@ onMounted(async () => {
       ),
     ]);
   } catch (error: unknown) {
-    console.warn("[host] permission front-load failed (continuing):", error);
+    devLog("host", "permission front-load failed (continuing)", error, "warn");
   }
   try {
     await Promise.all(adapters.map((adapter) => adapter.refresh()));
   } catch (error: unknown) {
-    console.warn("[withdraw] could not refresh the withdrawals:", error);
+    devLog("withdraw", "could not refresh the withdrawals", error, "warn");
   }
 });
 </script>
@@ -248,8 +261,11 @@ onMounted(async () => {
     :selection="selection"
     @back="returnFromPackage"
     @switch-route="switchRoute"
+    @change-amount="returnToAmount"
+    @use-amount="useAmount"
   />
   <FundingSelectorScreen
+    kind="withdraw"
     v-else-if="topUpsReady"
     :amount-screen="WithdrawAmountScreen"
     :config="withdrawalSelectorConfig"
@@ -273,6 +289,7 @@ onMounted(async () => {
   />
   <!-- The purse's read state carries into the skeleton, so the column doesn't jump on mount. -->
   <FundingSelectorScreen
+    kind="withdraw"
     v-else
     :amount-screen="WithdrawAmountScreen"
     :config="withdrawalSelectorConfig"

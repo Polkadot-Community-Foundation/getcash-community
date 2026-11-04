@@ -5,9 +5,13 @@
 // provider's minimum. The list, its order and its skeletons are OptionList's; `skeleton` forces
 // the skeletons, for the preview deck.
 import { computed, watch } from "vue";
+import { PSM_EXTERNAL } from "@getsome/funding";
+import { psmReserved } from "../../composables/useWithdrawalRequest";
+import { useRequestsStore } from "../../stores/requests";
 import { useWithdrawOffersStore } from "../../stores/withdraw-offers";
 import type { OptionListRow } from "../../utils/option-list";
 import { WITHDRAW_NETWORKS, type WithdrawNetwork } from "../../withdraw/destinations";
+import ScreenFrame from "../ui/ScreenFrame.vue";
 
 interface NetworkOption extends OptionListRow {
   network: WithdrawNetwork;
@@ -24,13 +28,11 @@ const props = withDefaults(
 const emit = defineEmits<{ pick: [network: WithdrawNetwork] }>();
 
 const offers = useWithdrawOffersStore();
+const requests = useRequestsStore();
 watch(
   () => props.amount,
   (amount) => {
-    // No route is decided before an address is in, so the rows are judged on the native pool
-    // sale, which every destination can be quoted for; the summary quotes the destination's own
-    // sale, and the confirm judges on that.
-    void offers.learn(amount, { tier: "pool" });
+    void offers.learn(amount, psmReserved(requests.openWithdrawals, PSM_EXTERNAL));
   },
   { immediate: true },
 );
@@ -47,7 +49,7 @@ const rows = computed<NetworkOption[]>(() =>
 </script>
 
 <template>
-  <div class="flex min-h-0 flex-1 flex-col">
+  <ScreenFrame>
     <OptionList
       :rows="rows"
       :loading="skeleton || offers.awaitingNetworks"
@@ -55,6 +57,8 @@ const rows = computed<NetworkOption[]>(() =>
       @pick="emit('pick', $event.network)"
     />
 
-    <PoweredBy class="mt-auto mb-4 pt-3" provider="Chainflip" />
-  </div>
+    <template #actions>
+      <PoweredBy provider="Chainflip" />
+    </template>
+  </ScreenFrame>
 </template>

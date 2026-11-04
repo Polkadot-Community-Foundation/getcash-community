@@ -14,6 +14,7 @@ import {
   type TokenSpec,
 } from "@getsome/core";
 import {
+  ChainflipRequestError,
   chainflipTokenOf,
   egressFor,
   SOURCE_CONFIG_BY_ID,
@@ -25,6 +26,7 @@ import {
   createManualRail,
   NoCashTransferError,
   PERMILL,
+  pickRoute,
   PSM_EXTERNAL,
   recordedRoute,
   type ConversionRoute,
@@ -46,7 +48,10 @@ import {
   createMeldClient,
   createMeldRail,
   ensureMeldAssets,
+  isAdapterOutage,
+  MeldAmountOutOfRangeError,
   pickBestQuote,
+  refusalOf,
   shareStatusReads,
   type MeldClientLike,
   type MeldQuoteRaw,
@@ -54,10 +59,13 @@ import {
 import { CASH_DECIMALS } from "@getsome/people";
 import { meldPaymentMethod, resolveMeldRegion } from "~~/lib/region";
 import {
+  countryName,
   fetchCorridor,
   DEFAULT_MELD_DESTINATION,
   fetchSupportedCorridors,
   fetchSupportedCountries,
+  mergeCorridorMaps,
+  mergeCountries,
   methodFor,
   type SupportedCorridor,
   type SupportedCountry,
@@ -96,18 +104,42 @@ import {
   sourceIdFor,
   type DepositAsset,
 } from "~~/lib/config";
+import { requestCreated } from "../funding/requests/telemetry";
 import { useRequestsStore } from "./requests";
+import { devLog } from "~~/lib/log";
+import { trackAction } from "~~/lib/telemetry";
+import { quoteCauseOf, reportQuoteFailure, type QuoteRail } from "../funding/quote-failure";
 
 export { DEPOSIT_EXPIRED_REASON } from "../funding/requests/model";
 
 /** Stand-in address for the mock world, which never touches a chain. */
 const DEV_RECIPIENT = "13ENScfFZXQ8avXf6cphack516B8YCjdL4MJbodm7VxK8GE9";
 
+/** A token as the Meld rail delivers it, with the app's name for it on Meld's rail. */
+type MeldRailToken = NonNullable<Parameters<typeof createMeldRail>[0]["token"]> & {
+  meldAsset: MeldAssetId;
+};
+
 /** The deposit token as Meld delivers it. Throws for a token Meld cannot deliver. */
-function meldTokenOf(token: TokenSpec): Parameters<typeof createMeldRail>[0]["token"] {
-  if (token.meldCurrencyCode === undefined) throw new Error(`Meld cannot deliver ${token.symbol}`);
-  return token as Parameters<typeof createMeldRail>[0]["token"];
+function meldTokenOf(token: TokenSpec): MeldRailToken {
+  if (token.meldAsset === undefined || token.meldCurrencyCode === undefined) {
+    throw new Error(`Meld cannot deliver ${token.symbol}`);
+  }
+  return token as MeldRailToken;
 }
+
+/** A hosted world built on a route, with the quote its rail answered. */
+type LiveQuote = { world: HostedCoinageWorld; quote: Quote };
+
+/** A Meld quote on a route, with the region's corridor for that route's token and the country
+ *  it was priced in. */
+type MeldRouteQuote = LiveQuote & { corridor: SupportedCorridor; country: string };
+
+/** What Chainflip answered for a hosted world built on a route: its quote, or that the purchase
+ *  is under the source's floor. */
+type RouteQuote = { world: HostedCoinageWorld } & (
+  { quote: Quote } | { minimum: SourceMinimumNotMetError }
+);
 
 /** Persisted per request; enough to re-open it. */
 export interface ActiveFlowRecord {
@@ -174,7 +206,7 @@ export interface ActiveFlowRecord {
 
 /** Awaits `work` with a timeout, logging the stage label before and after. */
 async function step<T>(label: string, ms: number, work: Promise<T>): Promise<T> {
-  console.warn(`[coinage] step: ${label}...`);
+  devLog("coinage", `step: ${label}...`, undefined, "warn");
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(
@@ -184,7 +216,7 @@ async function step<T>(label: string, ms: number, work: Promise<T>): Promise<T> 
   });
   try {
     const r = await Promise.race([work, timeout]);
-    console.warn(`[coinage] step: ${label} done`);
+    devLog("coinage", `step: ${label} done`, undefined, "warn");
     return r;
   } finally {
     clearTimeout(timer!);
@@ -196,6 +228,18 @@ const ahBlockLink = (block?: number) =>
   block === undefined
     ? ""
     : ` https://polkadot.js.org/apps/?rpc=${encodeURIComponent(NETWORK.assetHub.rpc)}#/explorer/query/${block}`;
+
+/** A Meld quote whose fiat falls outside the payment method's limits: not a failure to retry, an
+ *  amount to change. Decimal text throughout; `cash` is the bound in CASH, when it could be scaled. */
+export interface QuoteOutOfRange {
+  bound: "min" | "max";
+  /** The method's limit, in `fiat`. */
+  limit: string;
+  /** About what the amount asked for costs, in `fiat`. */
+  estimatedFiat: string;
+  fiat: string;
+  cash: string | null;
+}
 
 export interface QuotedView {
   send: string;
@@ -308,9 +352,12 @@ function warnOnFeeSplitDrift(raw: MeldQuoteRaw): void {
   const summed = sumMoney(transactionFee, networkFee, partnerFee);
   if (summed === null || !isMoneyAmount(totalFee)) return;
   if (Math.abs(summed - Number(totalFee)) < FEE_SPLIT_TOLERANCE) return;
-  console.warn(
-    `[meld] fee split does not add up: components sum to ${summed} against a reported total of ` +
+  devLog(
+    "meld",
+    `fee split does not add up: components sum to ${summed} against a reported total of ` +
       `${totalFee} ${raw.context.fiat}; the breakdown totals the reported figure`,
+    undefined,
+    "warn",
   );
 }
 
@@ -356,18 +403,23 @@ export const useSessionStore = defineStore("session", () => {
   /** Quote failures in a row for one amount, method, region and source: the screens stop offering
    *  another try after the second. Changing any of those starts the count over. */
   const quoteFailures = ref(0);
+  /** The amount's fiat falls outside the method's limits. Set instead of `quoteError`: retrying the
+   *  same amount cannot help, so it neither counts as a failure nor offers another try. */
+  const quoteOutOfRange = shallowRef<QuoteOutOfRange | null>(null);
+  /** A provider turned the amount down without naming a bound. Like `quoteOutOfRange`, the same
+   *  amount cannot quote, so the screen asks for a different one rather than offering a retry. */
+  const quoteAmountRejected = ref(false);
   /** True when the selected card or bank method is not routed for the chosen region. Not a quote
    *  failure; nothing to retry. */
   const meldMethodUnavailable = ref(false);
-  /** The crypto the Meld catalog is read for. `chooseQuoteRoute` sets it from the route the moment
-   *  one is chosen, and that value is what every quote is placed against. This initial value only
-   *  covers the window before then: the catalog loads when the pay screen mounts, before any amount
-   *  exists and so before a route can be chosen, so it assumes the PSM tier's external rather than
-   *  the fallback's. A route that comes back `pool` — the PSM paused, at its ceiling, or below its
-   *  minimum — moves it to the native and the watch below reloads. Off-host there is no PSM. */
-  const meldDestination = ref<MeldAssetId>(
-    (isHosted() ? TOKENS[PSM_EXTERNAL].meldAsset : undefined) ?? DEFAULT_MELD_DESTINATION,
-  );
+  /** The tokens the region dropdown's catalogs are read for. Hosted, a card or bank quote tries
+   *  the PSM's external and then the native, so a region counts when a provider delivers either
+   *  there; the external's catalog leads, as its route does. Off-host there is no PSM. */
+  const psmMeldAsset = isHosted() ? TOKENS[PSM_EXTERNAL].meldAsset : undefined;
+  const catalogDestinations: MeldAssetId[] =
+    psmMeldAsset === undefined
+      ? [DEFAULT_MELD_DESTINATION]
+      : [psmMeldAsset, DEFAULT_MELD_DESTINATION];
   /** Every Meld on-ramp country from the adapter's live catalog; null until loaded. */
   const supportedCountries = ref<SupportedCountry[] | null>(null);
   /** Bulk per-country corridors for greying the dropdown; null until loaded or when unreachable. */
@@ -457,7 +509,7 @@ export const useSessionStore = defineStore("session", () => {
       // does not know, comes back null rather than deriving against the wrong chain.
       return await probeRefundKey(sourceId as SourceId, tradeN);
     } catch (e) {
-      console.warn("[coinage] refund key recovery failed:", e);
+      devLog("coinage", "refund key recovery failed", e, "warn");
       return null;
     }
   }
@@ -470,19 +522,6 @@ export const useSessionStore = defineStore("session", () => {
       if (effectiveSourceId(ref) === sourceId) highest = Math.max(highest, ref.tradeN);
     }
     return highest + 1;
-  }
-
-  /**
-   * TODO: remove this cap once the deposit is real money. Any replacement must clear the swap
-   * networks' per-asset minimums, the highest of which is around 107 CASH (BTC).
-   */
-  const DEMO_MAX_CASH = 200_000_000n; // 200 CASH
-
-  function amountStatus(): "empty" | "over-cap" | "ok" {
-    if (amountBase.value === null) return "empty";
-    // Hosted only; the mock world is unbounded.
-    if (isHosted() && amountBase.value > DEMO_MAX_CASH) return "over-cap";
-    return "ok";
   }
 
   /** Prices the selected source for this budget, in `depositToken`, in the background.
@@ -510,6 +549,8 @@ export const useSessionStore = defineStore("session", () => {
     quoted.value = null;
     sourcePrice.value = null;
     quoteError.value = null;
+    quoteOutOfRange.value = null;
+    quoteAmountRejected.value = false;
     quoteFailures.value = 0;
     meldMethodUnavailable.value = false;
   }
@@ -520,6 +561,8 @@ export const useSessionStore = defineStore("session", () => {
     method.value = next;
     quoted.value = null;
     quoteError.value = null;
+    quoteOutOfRange.value = null;
+    quoteAmountRejected.value = false;
     quoteFailures.value = 0;
     meldMethodUnavailable.value = false;
   }
@@ -530,6 +573,8 @@ export const useSessionStore = defineStore("session", () => {
     meldCountry.value = code;
     quoted.value = null;
     quoteError.value = null;
+    quoteOutOfRange.value = null;
+    quoteAmountRejected.value = false;
     quoteFailures.value = 0;
     meldMethodUnavailable.value = false;
   }
@@ -565,7 +610,12 @@ export const useSessionStore = defineStore("session", () => {
    * continues.
    */
   function reconnectChains() {
-    console.warn("[coinage] chain follow died: evicting clients; the session reconnects in place");
+    devLog(
+      "coinage",
+      "chain follow died: evicting clients; the session reconnects in place",
+      undefined,
+      "warn",
+    );
     void import("~~/lib/host-chain").then((h) => h.evictChains());
   }
 
@@ -577,32 +627,51 @@ export const useSessionStore = defineStore("session", () => {
     requests.setTransientError(null);
     requests.fundingNotice = null;
     // Warn level with message strings: a host logger may forward only warn and error.
-    console.warn("[coinage] funding: handing off to the worker (fund the burner to begin)");
+    devLog(
+      "coinage",
+      "funding: handing off to the worker (fund the burner to begin)",
+      undefined,
+      "warn",
+    );
     void world
       .runFunding({
         onStep: (s) => {
-          console.warn(`[coinage] funding step: ${s}`);
+          devLog("coinage", `funding step: ${s}`, undefined, "warn");
           recordSharedFundingStep(ref, s);
         },
         onTransientError: (e) => {
-          console.warn(
-            `[coinage] funding transient: ${e instanceof Error ? e.message : String(e)}`,
+          devLog(
+            "coinage",
+            `funding transient: ${e instanceof Error ? e.message : String(e)}`,
+            undefined,
+            "warn",
           );
         },
         onTx: ({ call, txHash, block }) => {
-          console.warn(
-            `[coinage] funding tx: ${call} ${txHash} @ block ${block ?? "?"}${ahBlockLink(block)}`,
+          devLog(
+            "coinage",
+            `funding tx: ${call} ${txHash} @ block ${block ?? "?"}${ahBlockLink(block)}`,
+            undefined,
+            "warn",
           );
         },
         onClaimed: (amount) => {
-          console.warn(`[coinage] funding: the worker claimed ${amount} into the purse`);
+          devLog(
+            "coinage",
+            `funding: the worker claimed ${amount} into the purse`,
+            undefined,
+            "warn",
+          );
           // The record first, so the list is right whatever core makes of the resume below.
           markSettled(ref, amount);
           // The worker claims in the tick the CASH lands. A resume re-enters probe-first and
           // isSettled answers with the worker's claim.
           world.session.resume().catch((e: unknown) => {
-            console.warn(
-              `[coinage] funding: resume after the claim failed: ${e instanceof Error ? e.message : String(e)}`,
+            devLog(
+              "coinage",
+              `funding: resume after the claim failed: ${e instanceof Error ? e.message : String(e)}`,
+              undefined,
+              "warn",
             );
           });
         },
@@ -610,7 +679,7 @@ export const useSessionStore = defineStore("session", () => {
       .catch((e: unknown) => {
         // Shortfall, a refused hand-off, no worker: the session keeps waiting; say why.
         const reason = e instanceof Error ? e.message : String(e);
-        console.error(`[coinage] funding: failed: ${reason}`);
+        devLog("coinage", `funding: failed: ${reason}`, undefined, "error");
         // The screen shows the delay now; the record waits for the worker's verdict.
         requests.setTransientError({ message: reason, source: "handoff" });
         recordDriverFailure(ref, reason);
@@ -679,11 +748,35 @@ export const useSessionStore = defineStore("session", () => {
   }
 
   /**
+   * Asks the quote of the world being built on one route of a walk: the world with its quote, the
+   * failure with the world already let go, or null when a newer quote has superseded this one.
+   */
+  async function quoteLiveWorld(
+    epoch: number,
+    building: Promise<HostedCoinageWorld | null>,
+  ): Promise<LiveQuote | { world: HostedCoinageWorld; error: unknown } | null> {
+    const world = await building;
+    if (!world) return null;
+    if (epoch !== quoteEpoch) {
+      world.dispose();
+      return null;
+    }
+    try {
+      return { world, quote: await step("quote", 20_000, world.session.quote()) };
+    } catch (error) {
+      world.dispose();
+      return { world, error };
+    }
+  }
+
+  /**
    * The conversion tier a fresh quote is built on, decided once here and handed down: the rail
    * is built for the asset the tier delivers, and the world freezes the tier into the hand-off.
    * Nothing downstream decides again. `deposit` names the asset the buyer will send when the
-   * picker knows it; the fiat rails name none. The mock world runs over fakes with no PSM to
-   * ask, so outside the host the tier is the pool, fed with the stable the buyer picked.
+   * picker knows it; the fiat rails name none. A hosted Chainflip pick or Meld quote does not come
+   * here: each walks the ranked routes, in `runQuote` and `runMeldQuote`. The mock world runs over
+   * fakes with no PSM to ask, so outside the host the tier is the pool, fed with the stable the
+   * buyer picked.
    */
   async function chooseQuoteRoute(
     amount: bigint,
@@ -696,14 +789,7 @@ export const useSessionStore = defineStore("session", () => {
         : { tier: "pool", external: deposit };
     }
     const { chooseHostedRoute } = await import("~~/lib/coinage-live");
-    const route = await step("route selection", 10_000, chooseHostedRoute(amount, deposit));
-    // The catalog is read for the crypto the rail will be asked to deliver. A region validated
-    // against one destination and quoted against another is how a supported region yields an
-    // unquotable request, so the dropdown follows the route rather than a constant. A token Meld
-    // cannot deliver leaves it as it was.
-    const asset = depositTokenOf(route).meldAsset;
-    if (asset !== undefined) meldDestination.value = asset;
-    return route;
+    return step("route selection", 10_000, chooseHostedRoute(amount, deposit));
   }
 
   /** The quote in flight, whichever rail: start() waits for it before opening the deposit. */
@@ -740,7 +826,7 @@ export const useSessionStore = defineStore("session", () => {
 
   /**
    * Builds the Meld rail for the current selection and the token the route delivers, or signals
-   * that the method is not routed for the region.
+   * that the method is not routed for the region. The corridor read is that token's.
    */
   async function buildMeldRail(route: ConversionRoute): Promise<
     | {
@@ -757,17 +843,27 @@ export const useSessionStore = defineStore("session", () => {
     const meldMethod = uiMethod === "card" ? "CARD" : "BANK_TRANSFER";
     const sourceId: SourceId = uiMethod === "card" ? "meld-card" : "meld-bank";
     const country = effectiveMeldCountry();
+    const token = meldTokenOf(depositTokenOf(route));
     // The live corridor is authoritative when discovery is reachable. Otherwise fall back to the
     // static region map as a whole {country, fiat} tuple with a synthetic corridor. The caller
     // assigns `meldCorridor` after its epoch guard.
-    const live = await fetchCorridor(meldDestination.value, country);
+    const live = await fetchCorridor(token.meldAsset, country);
     let region: { country: string; fiat: string };
     let corridor: SupportedCorridor;
     let paymentMethodType: string | null;
+    // The method's fiat limits, which seed the rail's rate probe and bound what it will quote.
+    let limits: { min?: string; max?: string } | undefined;
     if (live !== null) {
       region = { country, fiat: live.fiat };
       corridor = live;
-      paymentMethodType = methodFor(live, uiMethod)?.paymentMethodType ?? null;
+      const liveMethod = methodFor(live, uiMethod);
+      paymentMethodType = liveMethod?.paymentMethodType ?? null;
+      if (liveMethod !== null && liveMethod.currency === live.fiat) {
+        limits = {
+          ...(liveMethod.min !== "" ? { min: liveMethod.min } : {}),
+          ...(liveMethod.max !== "" ? { max: liveMethod.max } : {}),
+        };
+      }
     } else {
       region = resolveMeldRegion(country);
       corridor = staticCorridor(region);
@@ -808,9 +904,41 @@ export const useSessionStore = defineStore("session", () => {
       fiat: region.fiat,
       method: meldMethod,
       paymentMethodType,
-      token: meldTokenOf(depositTokenOf(route)),
+      token,
+      ...(limits === undefined ? {} : { limits }),
     });
     return { rail, sourceId, client: meldClient, region, paymentMethodType, corridor };
+  }
+
+  /**
+   * The native budget a mock-world Meld rail must deliver for `settleAmount` CASH: the Asset Hub
+   * pool the funding leg converts through, read live and sized as the crypto route sizes it, with
+   * the leg's fees on top. The rail then asks Meld what that native costs in the buyer's fiat.
+   * Null when the pool cannot be read.
+   */
+  async function poolNativeBudget(
+    settleAmount: bigint,
+    sizing: PoolFundingSizing,
+  ): Promise<bigint | null> {
+    try {
+      const [{ connectChain, ASSET_HUB }, { sizeNativeBudget, PASEO_UNDERLYING_ASSET_ID }] =
+        await Promise.all([import("~~/lib/host-chain"), import("@getsome/funding")]);
+      const client = await connectChain(ASSET_HUB);
+      return await step(
+        "pool quote (public read)",
+        30_000,
+        sizeNativeBudget({
+          client,
+          underlyingAssetId: PASEO_UNDERLYING_ASSET_ID,
+          settleAmount,
+          remoteFeeBuffer: sizing.remoteFeeBuffer,
+          keepNativeForFees: sizing.keepNativeForFees,
+        }),
+      );
+    } catch (e) {
+      devLog("meld", "live pool pricing unavailable", e, "warn");
+      return null;
+    }
   }
 
   /**
@@ -818,7 +946,8 @@ export const useSessionStore = defineStore("session", () => {
    * provider quote with CASH pegged to one unit of the quote fiat. Returns null when the provider
    * has no offer for this corridor.
    *
-   * Known limit: the peg is to the quote fiat, not USD; a non-USD region is off by the FX rate.
+   * Node test runs only, which have no pool to read: the peg is to the quote fiat, not USD, so a
+   * non-USD region is off by the FX rate. A browser prices on the pool (`poolNativeBudget`).
    */
   async function sizeMeldNativeBudget(
     client: MeldClientLike,
@@ -874,11 +1003,72 @@ export const useSessionStore = defineStore("session", () => {
     });
   }
 
-  /** A quote that could not be had: the message for the screen, and one more failure in a row. */
-  function failQuote(message: string): void {
+  /**
+   * About what `e`'s bound comes to in CASH base units, scaled from this amount by the cost the rail
+   * solved: whole CASH, rounded toward the inside of the range, so the figure offered is one that
+   * quotes. Null when it cannot be scaled.
+   */
+  function boundCashOf(e: MeldAmountOutOfRangeError): bigint | null {
+    const limitCents = Math.round(Number(e.limit) * 100);
+    const costCents = Math.round(Number(e.estimatedFiat) * 100);
+    const amount = amountBase.value;
+    if (amount === null || limitCents <= 0 || costCents <= 0) return null;
+    const unit = 10n ** BigInt(CASH_DECIMALS);
+    const scaled = amount * BigInt(limitCents);
+    const whole =
+      e.bound === "min"
+        ? (scaled + BigInt(costCents) * unit - 1n) / (BigInt(costCents) * unit)
+        : scaled / (BigInt(costCents) * unit);
+    return whole > 0n ? whole * unit : null;
+  }
+
+  /** An amount whose fiat falls outside the method's limits, for the screen: the bound and the cost
+   *  in the fiat, and about what the bound comes to in CASH. */
+  function outOfRangeOf(e: MeldAmountOutOfRangeError): QuoteOutOfRange {
+    const cash = boundCashOf(e);
+    return {
+      bound: e.bound,
+      limit: e.limit,
+      estimatedFiat: e.estimatedFiat,
+      fiat: e.fiat,
+      cash: cash === null ? null : fmtCash(cash),
+    };
+  }
+
+  /** Of several routes' limits, the easiest to reach: the one whose bound in CASH is nearest the
+   *  amount. One with a figure beats one without. */
+  function nearestOutOfRange(
+    errors: readonly MeldAmountOutOfRangeError[],
+  ): MeldAmountOutOfRangeError | undefined {
+    const amount = amountBase.value ?? 0n;
+    let nearest: MeldAmountOutOfRangeError | undefined;
+    let nearestDistance: bigint | null = null;
+    for (const e of errors) {
+      const cash = boundCashOf(e);
+      const distance = cash === null ? null : cash > amount ? cash - amount : amount - cash;
+      if (
+        nearest === undefined ||
+        (distance !== null && (nearestDistance === null || distance < nearestDistance))
+      ) {
+        nearest = e;
+        nearestDistance = distance;
+      }
+    }
+    return nearest;
+  }
+
+  /** A quote that could not be had: the message for the screen, one more failure in a row, and
+   *  the failure reported as the rail and its cause. */
+  function failQuote(
+    message: string,
+    rail: QuoteRail,
+    why: string,
+    details: { error?: unknown; context?: Record<string, string> } = {},
+  ): void {
     quoted.value = null;
     quoteError.value = message;
     quoteFailures.value += 1;
+    reportQuoteFailure(rail, why, details);
   }
 
   /** (Re)quotes the Meld rail for the current CASH amount and region. The mock world simulates
@@ -894,31 +1084,33 @@ export const useSessionStore = defineStore("session", () => {
     lastQuoteParams = { chain: "Meld", asset: method.value === "bank" ? "Bank" : "Card" };
     const epoch = quoteEpoch;
     quoteError.value = null;
+    quoteOutOfRange.value = null;
+    quoteAmountRejected.value = false;
     meldMethodUnavailable.value = false;
-    // Over the cap there is nothing to quote.
-    if (amountBase.value === null || amountStatus() === "over-cap") {
+    // Nothing entered, nothing to quote.
+    if (amountBase.value === null) {
       loading.value = false;
       return;
     }
     loading.value = true;
     try {
-      // The tier first: the rail is built for the asset the tier delivers.
-      const route = await chooseQuoteRoute(amountBase.value);
-      if (epoch !== quoteEpoch) return;
-      const built = await buildMeldRail(route);
-      // A newer quote may have started while the corridor probe was in flight; do not clobber its
-      // state.
-      if (epoch !== quoteEpoch) return;
-      meldCorridor.value = built.corridor;
-      if ("unavailable" in built) {
-        meldMethodUnavailable.value = true;
-        loading.value = false;
-        return;
-      }
-      // The country the quote is priced in; a re-open quotes the same region.
-      meldRegionCountry = built.region.country;
       // Mock world: quote, session and widget are real; settlement is simulated by the harness.
       if (!isHosted()) {
+        // The tier first: the rail is built for the asset the tier delivers.
+        const route = await chooseQuoteRoute(amountBase.value);
+        if (epoch !== quoteEpoch) return;
+        const built = await buildMeldRail(route);
+        // A newer quote may have started while the corridor probe was in flight; do not clobber
+        // its state.
+        if (epoch !== quoteEpoch) return;
+        meldCorridor.value = built.corridor;
+        if ("unavailable" in built) {
+          meldMethodUnavailable.value = true;
+          loading.value = false;
+          return;
+        }
+        // The country the quote is priced in; a re-open quotes the same region.
+        meldRegionCountry = built.region.country;
         // The funding leg's fees, from the same public reads the crypto route prices with. They
         // enlarge the budget the rail must deliver — the buyer pays for them — and the quote
         // reports them as their own row. Skipped in node test runs, which have no chain to read:
@@ -926,19 +1118,38 @@ export const useSessionStore = defineStore("session", () => {
         const sizing = await meldFundingSizing(amountBase.value);
         if (epoch !== quoteEpoch) return;
         // The Meld rail egresses the native token and is sized by a native budget: the settle
-        // amount plus People's execution fee, quoted against the fiat peg, plus the native the
-        // burner keeps for the program on Asset Hub.
-        const quotedBudget = await sizeMeldNativeBudget(
-          built.client,
-          { ...built.region, paymentMethodType: built.paymentMethodType },
-          amountBase.value + sizing.remoteFeeBuffer,
-        );
-        if (epoch !== quoteEpoch) return;
-        if (quotedBudget === null) {
-          failQuote("No provider offers this payment method or region. Try another.");
-          return;
+        // amount plus People's execution fee, priced on the pool, plus the native the burner keeps
+        // for the program on Asset Hub. The rail's quote then solves what it costs in fiat.
+        let nativeBudget: bigint;
+        if (typeof window !== "undefined") {
+          const pooled = await poolNativeBudget(amountBase.value, sizing);
+          if (epoch !== quoteEpoch) return;
+          if (pooled === null) {
+            failQuote(
+              "Couldn't price this amount right now. Please try again.",
+              method.value === "bank" ? "bank" : "card",
+              "no-price",
+            );
+            return;
+          }
+          nativeBudget = pooled;
+        } else {
+          const quotedBudget = await sizeMeldNativeBudget(
+            built.client,
+            { ...built.region, paymentMethodType: built.paymentMethodType },
+            amountBase.value + sizing.remoteFeeBuffer,
+          );
+          if (epoch !== quoteEpoch) return;
+          if (quotedBudget === null) {
+            failQuote(
+              "No provider offers this payment method or region. Try another.",
+              method.value === "bank" ? "bank" : "card",
+              "no-provider",
+            );
+            return;
+          }
+          nativeBudget = quotedBudget + sizing.keepNativeForFees;
         }
-        const nativeBudget = quotedBudget + sizing.keepNativeForFees;
         const world = await createMockCoinageSession({
           recipient: DEV_RECIPIENT,
           amount: amountBase.value,
@@ -961,40 +1172,116 @@ export const useSessionStore = defineStore("session", () => {
         return;
       }
       // Hosted world: the same rail over the real host seams. The provider delivers the route's
-      // token to the burner and the funding leg converts it to CASH.
-      const { nextHostedTradeNumber } = await import("~~/lib/coinage-live");
-      const tradeN = await step(
-        "trade number",
-        10_000,
-        nextHostedTradeNumber(built.sourceId, (n) => requests.hasTrace(built.sourceId, n)),
-      );
-      const world = await createLiveWorld(
-        epoch,
-        depositWindowFor(method.value),
-        route,
-        tradeN,
-        built.rail,
-        built.sourceId,
-      );
-      if (!world) return;
+      // token to the burner and the funding leg converts it to CASH. Each route the chain ranks is
+      // asked in turn, on the region's corridor for its token, until a provider quotes it.
+      const { nextHostedTradeNumber, rankHostedRoutes } = await import("~~/lib/coinage-live");
+      const routes = await step("route selection", 10_000, rankHostedRoutes(amountBase.value));
+      if (epoch !== quoteEpoch) return;
+      // Every route is tried on one trade number: a Meld world writes nothing to storage and its
+      // quote opens no session, so a world let go leaves nothing behind.
+      let tradeN: number | undefined;
+      let firstCorridor: SupportedCorridor | null = null;
+      // The outage that ended the walk, else the first quote a route failed. None when no route's
+      // corridor routes the method.
+      let failure: unknown;
+      const outOfRange: MeldAmountOutOfRangeError[] = [];
+      const pick = await pickRoute<MeldRouteQuote | null>(routes, async (route) => {
+        const built = await buildMeldRail(route);
+        if (epoch !== quoteEpoch) return { kind: "accepted", value: null };
+        firstCorridor ??= built.corridor;
+        if ("unavailable" in built) {
+          return { kind: "refused", reason: "the method is not routed for this token" };
+        }
+        tradeN ??= await step(
+          "trade number",
+          10_000,
+          nextHostedTradeNumber(built.sourceId, (n) => requests.hasTrace(built.sourceId, n)),
+        );
+        const asked = await quoteLiveWorld(
+          epoch,
+          createLiveWorld(
+            epoch,
+            depositWindowFor(method.value),
+            route,
+            tradeN,
+            built.rail,
+            built.sourceId,
+          ),
+        );
+        if (asked === null) return { kind: "accepted", value: null };
+        if ("quote" in asked) {
+          const value = { ...asked, corridor: built.corridor, country: built.region.country };
+          return { kind: "accepted", value };
+        }
+        const { error } = asked;
+        const reason = error instanceof Error ? error.message : String(error);
+        // An adapter that does not answer is the same adapter on the next route. A quote out of
+        // time, or out of this token's limits, is this route's refusal.
+        if (isAdapterOutage(error)) {
+          failure = error;
+          return { kind: "outage", reason };
+        }
+        if (error instanceof MeldAmountOutOfRangeError) outOfRange.push(error);
+        failure ??= error;
+        return { kind: "refused", reason };
+      });
       if (epoch !== quoteEpoch) {
-        world.dispose();
+        if (pick.kind === "picked") pick.value?.world.dispose();
         return;
       }
-      const quote = await step("quote", 20_000, world.session.quote());
-      if (epoch !== quoteEpoch) {
-        world.dispose();
-        return;
+      if (pick.kind !== "picked") {
+        meldCorridor.value = firstCorridor;
+        if (failure === undefined) {
+          meldMethodUnavailable.value = true;
+          return;
+        }
+        if (pick.kind === "outage") throw failure;
+        throw nearestOutOfRange(outOfRange) ?? failure;
       }
+      const { value } = pick;
+      if (value === null) return;
+      const { world, quote } = value;
+      meldCorridor.value = value.corridor;
+      // The country the quote is priced in; a re-open quotes the same region.
+      meldRegionCountry = value.country;
       live.value = world;
       quoted.value = meldQuotedView(quote.raw as MeldQuoteRaw, world.fundingSizing);
       quoteFailures.value = 0;
     } catch (e: unknown) {
       if (epoch !== quoteEpoch) return; // a newer quote owns the state now
       // The host logger renders an Error as `{}`; log the message, as the transient
-      // hooks above already do, or a failed quote is undiagnosable from a device log.
-      console.error(`[meld] quote failed: ${e instanceof Error ? e.message : String(e)}`);
-      failQuote(e instanceof Error ? e.message : String(e));
+      // hooks above already do, or a failed quote is undiagnosable from a device log. The
+      // adapter's tag and code go to the log only: the screen stays generic for them.
+      const refusal = refusalOf(e);
+      const said =
+        refusal === undefined
+          ? ""
+          : ` (HTTP ${refusal.status} ${refusal.tag ?? "untagged"}${refusal.code ? ` ${refusal.code}` : ""})`;
+      devLog(
+        "meld",
+        `quote failed${said}: ${e instanceof Error ? e.message : String(e)}`,
+        undefined,
+        "error",
+      );
+      if (e instanceof MeldAmountOutOfRangeError) {
+        quoted.value = null;
+        quoteOutOfRange.value = outOfRangeOf(e);
+        return;
+      }
+      if (refusal?.code === "AMOUNT_REJECTED") {
+        quoted.value = null;
+        quoteAmountRejected.value = true;
+        return;
+      }
+      failQuote(
+        e instanceof Error ? e.message : String(e),
+        method.value === "bank" ? "bank" : "card",
+        quoteCauseOf(e),
+        {
+          error: e,
+          ...(refusal?.tag ? { context: { tag: refusal.tag } } : {}),
+        },
+      );
     } finally {
       if (epoch === quoteEpoch) loading.value = false;
     }
@@ -1017,15 +1304,15 @@ export const useSessionStore = defineStore("session", () => {
     lastQuoteParams = { chain, asset };
     const epoch = quoteEpoch;
     quoteError.value = null;
-    // Over the cap there is nothing to quote.
-    if (amountBase.value === null || amountStatus() === "over-cap") {
+    quoteOutOfRange.value = null;
+    quoteAmountRejected.value = false;
+    // Nothing entered, nothing to quote.
+    if (amountBase.value === null) {
       loading.value = false;
       return;
     }
     loading.value = true;
-    console.info(
-      `[coinage] quoting in the ${isHosted() ? "LIVE (hosted)" : "MOCK (browser)"} world`,
-    );
+    devLog("coinage", `quoting in the ${isHosted() ? "LIVE (hosted)" : "MOCK (browser)"} world`);
     try {
       // A direct Polkadot pick names the token it deposits; a Chainflip pick leaves the route to
       // the amount. Either way the world runs under the pick's own source.
@@ -1035,42 +1322,56 @@ export const useSessionStore = defineStore("session", () => {
         return;
       }
       const direct = isDirectSourceId(sourceId) ? sourceId : null;
-      const route = await chooseQuoteRoute(
-        amountBase.value,
-        direct === null ? undefined : depositAssetFor(direct),
-      );
-      if (epoch !== quoteEpoch) return;
+      const deposit = direct === null ? undefined : depositAssetFor(direct);
       if (isHosted()) {
-        const { nextHostedTradeNumber } = await import("~~/lib/coinage-live");
+        const { nextHostedTradeNumber, rankHostedRoutes } = await import("~~/lib/coinage-live");
+        // A direct pick's token has one route. A Chainflip pick asks Chainflip about each route
+        // the chain ranks until one can be quoted.
+        const routes =
+          direct === null
+            ? await step("route selection", 10_000, rankHostedRoutes(amountBase.value))
+            : [await chooseQuoteRoute(amountBase.value, deposit)];
+        if (epoch !== quoteEpoch) return;
         const tradeN = await step(
           "trade number",
           10_000,
           nextHostedTradeNumber(sourceId, (n) => requests.hasTrace(sourceId, n)),
         );
-        const world = await createLiveWorld(
-          epoch,
-          depositWindowFor("crypto"),
-          route,
-          tradeN,
-          undefined,
-          sourceId,
-        );
-        if (!world) return; // superseded by a newer quote
+        // Every route is tried on this one number: building a world and asking its quote write
+        // neither a flow slot nor a record, so a world let go leaves no request behind.
+        let refusal: unknown;
+        const pick = await pickRoute<RouteQuote | null>(routes, async (route) => {
+          const asked = await quoteLiveWorld(
+            epoch,
+            createLiveWorld(epoch, depositWindowFor("crypto"), route, tradeN, undefined, sourceId),
+          );
+          // Quoted, or superseded by a newer quote: either way nothing further is asked.
+          if (asked === null || "quote" in asked) return { kind: "accepted", value: asked };
+          // Chainflip can refuse, on a floor, a pair or an outage, and the world and its burner
+          // are let go. The floor is on the buyer's token, the same on every route, so it ends the
+          // walk as an answer; an outage ends it as a failure.
+          const { world, error: e } = asked;
+          if (e instanceof SourceMinimumNotMetError) {
+            return { kind: "accepted", value: { world, minimum: e } };
+          }
+          if (e instanceof ChainflipRequestError && e.outage) throw e;
+          refusal ??= e;
+          return { kind: "refused", reason: e instanceof Error ? e.message : String(e) };
+        });
+        if (pick.kind !== "picked") throw refusal;
+        const { route, value } = pick;
+        if (value === null) return;
+        const { world } = value;
         if (epoch !== quoteEpoch) {
           world.dispose();
           return;
         }
-        let quote: Quote;
         const depositToken = chainflipTokenOf(depositTokenOf(route));
-        try {
-          quote = await step("quote", 20_000, world.session.quote());
-        } catch (e) {
-          // Chainflip can refuse, on a floor or an outage: the world and its burner are let go.
-          world.dispose();
-          if (!(e instanceof SourceMinimumNotMetError)) throw e;
-          if (epoch !== quoteEpoch) return;
-          console.info(
-            `[coinage] quote: below the ${e.assetSymbol} floor (${e.minimumFormatted} ${e.assetSymbol}); this purchase needs ${e.neededFormatted}`,
+        if ("minimum" in value) {
+          const e = value.minimum;
+          devLog(
+            "coinage",
+            `quote: below the ${e.assetSymbol} floor (${e.minimumFormatted} ${e.assetSymbol}); this purchase needs ${e.neededFormatted}`,
           );
           // Under the source's floor is not an error to show: the picker greys the row, held
           // against the budget the world sized before Chainflip was asked, and the other sources
@@ -1086,10 +1387,7 @@ export const useSessionStore = defineStore("session", () => {
           sourcePrice.value = { kind: "minimum", minimum: sourceMinimumOf(e) };
           return;
         }
-        if (epoch !== quoteEpoch) {
-          world.dispose();
-          return;
-        }
+        const { quote } = value;
         live.value = world;
         quoteFailures.value = 0;
         quoted.value = {
@@ -1103,6 +1401,8 @@ export const useSessionStore = defineStore("session", () => {
         // The rail's own figure is the pay card's price; a direct deposit has no swap to price.
         if (direct === null) sourcePrice.value = { kind: "price", price: sourcePriceOf(quote) };
       } else {
+        const route = await chooseQuoteRoute(amountBase.value, deposit);
+        if (epoch !== quoteEpoch) return;
         // Real pricing outside the host: the pool leg is a public chain read over a standalone
         // WebSocket. Skipped in node test runs; falls back to demo rates when the RPC is
         // unreachable. A stable deposit has nothing to read, the fakes take it one to one.
@@ -1148,7 +1448,7 @@ export const useSessionStore = defineStore("session", () => {
                 }))(),
             );
           } catch (e) {
-            console.warn("[coinage] live pool pricing unavailable, using demo rates:", e);
+            devLog("coinage", "live pool pricing unavailable, using demo rates", e, "warn");
           }
         }
         if (epoch !== quoteEpoch) return;
@@ -1205,13 +1505,23 @@ export const useSessionStore = defineStore("session", () => {
       const msg = e instanceof Error ? e.message : String(e);
       // A dead chainHead follow poisons the cached clients. Reconnect and retry once.
       if (/disjointed/i.test(msg) && !isRetry) {
-        console.warn("[coinage] chain follow died: reconnecting and retrying the quote");
+        devLog(
+          "coinage",
+          "chain follow died: reconnecting and retrying the quote",
+          undefined,
+          "warn",
+        );
         const { evictChains } = await import("~~/lib/host-chain");
         evictChains();
         return fetchQuote(chain, asset, true);
       }
-      console.error(`[coinage] quote failed: ${e instanceof Error ? e.message : String(e)}`);
-      failQuote(msg);
+      devLog(
+        "coinage",
+        `quote failed: ${e instanceof Error ? e.message : String(e)}`,
+        undefined,
+        "error",
+      );
+      failQuote(msg, "crypto", quoteCauseOf(e), { error: e, context: { chain, asset } });
     } finally {
       if (epoch === quoteEpoch) loading.value = false;
     }
@@ -1251,6 +1561,8 @@ export const useSessionStore = defineStore("session", () => {
     teardownWorld();
     loading.value = false;
     quoteError.value = null;
+    quoteOutOfRange.value = null;
+    quoteAmountRejected.value = false;
     quoteFailures.value = 0;
     resuming.value = false;
     method.value = "crypto";
@@ -1418,10 +1730,15 @@ export const useSessionStore = defineStore("session", () => {
         },
         witnesses: {},
       };
+      // This page starts the request: its journey begins here, even if the record's write fails.
+      requestCreated(record);
       await requests.create(ref, record);
     } catch (e) {
-      console.warn(
-        `[coinage] request record write failed (it will not be re-openable): ${e instanceof Error ? e.message : String(e)}`,
+      devLog(
+        "coinage",
+        `request record write failed (it will not be re-openable): ${e instanceof Error ? e.message : String(e)}`,
+        undefined,
+        "warn",
       );
     }
   }
@@ -1438,10 +1755,20 @@ export const useSessionStore = defineStore("session", () => {
       depositExpiresAt,
     });
     if (requests.get(ref)?.status.kind !== "cancelled") {
-      console.warn(`[coinage] cancel refused: request #${ref.tradeN} is past its deposit`);
+      devLog(
+        "coinage",
+        `cancel refused: request #${ref.tradeN} is past its deposit`,
+        undefined,
+        "warn",
+      );
       return false;
     }
-    console.warn(`[coinage] request #${ref.tradeN} tombstoned (cancelled; deposit window watched)`);
+    devLog(
+      "coinage",
+      `request #${ref.tradeN} tombstoned (cancelled; deposit window watched)`,
+      undefined,
+      "warn",
+    );
     void cancelWorkerJob(workerSessionId(ref.sourceId, ref.tradeN));
     void reconcileBackground(); // drops the row
     return true;
@@ -1454,8 +1781,11 @@ export const useSessionStore = defineStore("session", () => {
       const { getStorageWorkerManager } = await import("~~/lib/worker-rpc");
       await getStorageWorkerManager().call("cancelFunding", { sessionId });
     } catch (e) {
-      console.warn(
-        `[coinage] worker cancel for ${sessionId} failed: ${e instanceof Error ? e.message : String(e)}`,
+      devLog(
+        "coinage",
+        `worker cancel for ${sessionId} failed: ${e instanceof Error ? e.message : String(e)}`,
+        undefined,
+        "warn",
       );
     }
   }
@@ -1481,7 +1811,7 @@ export const useSessionStore = defineStore("session", () => {
       })
       .then(() => reconcileBackground()) // refreshes the list
       .catch((e: unknown) => {
-        console.warn("[coinage] could not record the finished purchase:", e);
+        devLog("coinage", "could not record the finished purchase", e, "warn");
       });
   }
 
@@ -1551,8 +1881,11 @@ export const useSessionStore = defineStore("session", () => {
       // truth, as the note on the mock world below says.
       if (isHosted() && record.meldFundingRequestId !== undefined) meldPayUrlPending.value = true;
       const status = requests.get(ref)?.status.kind ?? "?";
-      console.warn(
-        `[coinage] reopen request #${record.tradeN}: funded=${record.funded ?? "no"} status=${status} submitted=${record.meldSubmittedAt !== undefined}`,
+      devLog(
+        "coinage",
+        `reopen request #${record.tradeN}: funded=${record.funded ?? "no"} status=${status} submitted=${record.meldSubmittedAt !== undefined}`,
+        undefined,
+        "warn",
       );
       // Display context for the journey, from the record itself; neither path re-quotes.
       const displayQuote: QuotedView = {
@@ -1585,8 +1918,11 @@ export const useSessionStore = defineStore("session", () => {
       if (!isHosted()) {
         const amount = amountBase.value;
         if (amount === null) {
-          console.warn(
-            `[coinage] reopen request #${record.tradeN}: "${record.amountHuman}" is not an amount`,
+          devLog(
+            "coinage",
+            `reopen request #${record.tradeN}: "${record.amountHuman}" is not an amount`,
+            undefined,
+            "warn",
           );
           return false;
         }
@@ -1644,8 +1980,11 @@ export const useSessionStore = defineStore("session", () => {
       if (world.session.peek() === null) {
         // A record with no slot: keep it, note the conflict on it, and fall back to a fresh entry.
         world.dispose();
-        console.warn(
-          `[coinage] reopen request #${record.tradeN}: no flow slot to resume; the record is kept`,
+        devLog(
+          "coinage",
+          `reopen request #${record.tradeN}: no flow slot to resume; the record is kept`,
+          undefined,
+          "warn",
         );
         void requests.flag(ref, "core slot missing on resume");
         reset();
@@ -1670,8 +2009,11 @@ export const useSessionStore = defineStore("session", () => {
         const meldBaseUrl = import.meta.env.VITE_MELD_BASE_URL as string | undefined;
         if (!meldBaseUrl) {
           // This build has no adapter to ask; say which request is going unwatched.
-          console.warn(
-            `[meld] request #${String(record.tradeN)} persisted funding id ${record.meldFundingRequestId}, but VITE_MELD_BASE_URL is unset; its payment status cannot be resumed`,
+          devLog(
+            "meld",
+            `request #${String(record.tradeN)} persisted funding id ${record.meldFundingRequestId}, but VITE_MELD_BASE_URL is unset; its payment status cannot be resumed`,
+            undefined,
+            "warn",
           );
           meldPayUrlPending.value = false;
         } else {
@@ -1713,7 +2055,7 @@ export const useSessionStore = defineStore("session", () => {
     } catch (e) {
       if (epoch !== quoteEpoch) return false; // a newer quote owns the state now
       // The record survives a failed resume.
-      console.warn("[coinage] resume failed, falling back to a fresh start:", e);
+      devLog("coinage", "resume failed, falling back to a fresh start", e, "warn");
       reset();
       return false;
     } finally {
@@ -1722,7 +2064,8 @@ export const useSessionStore = defineStore("session", () => {
   }
 
   // Demo faucet
-  async function fundFaucet(): Promise<void> {
+  /** Resolves true once the transfer is broadcast with its request still on screen. */
+  async function fundFaucet(): Promise<boolean> {
     const s = lastState.value;
     // "sent" blocks too: the transfer was broadcast, and the deposit watch takes it from there.
     // A refused transfer resets to "idle".
@@ -1733,9 +2076,13 @@ export const useSessionStore = defineStore("session", () => {
       faucetState.value === "funding" ||
       faucetState.value === "sent"
     )
-      return;
+      return false;
     faucetState.value = "funding";
     void markDepositSkipped();
+    // The faucet state and its error belong to the request on screen: a transfer that settles
+    // after the buyer moved to another request leaves that request's Skip alone.
+    const key = foregroundRef && requestRefKey(foregroundRef);
+    const onScreen = () => (foregroundRef && requestRefKey(foregroundRef)) === key;
     try {
       // The faucet stands in for the rail: it sends the burner what the rail would deliver, in
       // the route's token, the one the pipeline reads the burner for. A Polkadot deposit asks the
@@ -1746,13 +2093,17 @@ export const useSessionStore = defineStore("session", () => {
         amount: isDirectSourceId(live.value.sourceId) ? s.deposit.amount : live.value.budget,
         route: live.value.route,
       });
+      if (!onScreen()) return false;
       faucetState.value = "sent";
+      return true;
     } catch (e: unknown) {
+      if (!onScreen()) return false;
       faucetState.value = "idle";
       requests.setTransientError({
         message: e instanceof Error ? e.message : String(e),
         source: "faucet",
       });
+      return false;
     }
   }
 
@@ -1870,7 +2221,7 @@ export const useSessionStore = defineStore("session", () => {
         mismatchPrice.value = { key, at: Date.now(), route, value };
       }
     } catch (e) {
-      console.warn("[coinage] could not price the deposit that arrived; trying again:", e);
+      devLog("coinage", "could not price the deposit that arrived; trying again", e, "warn");
       setTimeout(() => {
         const current = foregroundMismatch.value;
         if (current?.key === key && mismatchPrice.value?.key !== key) {
@@ -1965,7 +2316,7 @@ export const useSessionStore = defineStore("session", () => {
       requests.restartDepositWatch();
       return true;
     } catch (e) {
-      console.warn("[coinage] could not continue with the deposit that arrived:", e);
+      devLog("coinage", "could not continue with the deposit that arrived", e, "warn");
       mismatchError.value = "Couldn't continue with this deposit. Try again in a moment.";
       return false;
     } finally {
@@ -2001,7 +2352,7 @@ export const useSessionStore = defineStore("session", () => {
 
   /** Credits the settled Meld payment into the coinage leg, once. A no-op in the host world. */
   function creditMeldSettlement() {
-    if (meldCredited) return;
+    if (meldCredited || !mock.value) return;
     meldCredited = true;
     simulateDeposit();
   }
@@ -2025,6 +2376,11 @@ export const useSessionStore = defineStore("session", () => {
    *
    * The poll is stopped first. It re-reads the rail on its own cadence and would overwrite these
    * stages with whatever the (unpaid, or faked) request really says.
+   *
+   * The hosted demo's deposit leaves on the press, as on every other Skip: the play stops with the
+   * screen, and a buyer who leaves mid-play must not take the deposit with it. The provider's steps
+   * wait for that transfer to be broadcast: a refused one would leave the record reporting a
+   * payment that never came, with no Cancel, since the rail is taken to hold the money.
    */
   function simulateMeldPayment(): void {
     const ref = foregroundRef;
@@ -2046,14 +2402,19 @@ export const useSessionStore = defineStore("session", () => {
     // The buyer finishes in the widget: the journey takes over from the iframe.
     void markMeldSubmitted();
     // The provider sees the transaction, then approves it.
-    step(() => report("receiving"));
-    step(() => report("complete"));
-    // The conversion runs, and the deposit that pays for it arrives: the mock world fakes it
-    // through `creditMeldSettlement`, the hosted demo needs the faucet. The real pipeline takes
-    // the journey the rest of the way.
-    step(() => {
-      if (mock.value) creditMeldSettlement();
-      else void fundFaucet();
+    const play = () => {
+      step(() => report("receiving"));
+      step(() => report("complete"));
+    };
+    if (mock.value) {
+      play();
+      // The mock world fakes the deposit that pays for the conversion. The real pipeline takes
+      // the journey the rest of the way.
+      step(creditMeldSettlement);
+      return;
+    }
+    void fundFaucet().then((sent) => {
+      if (sent) play();
     });
   }
 
@@ -2061,8 +2422,22 @@ export const useSessionStore = defineStore("session", () => {
   const meldPayUrl = computed<string | null>(() => {
     // Hidden once the buyer finished the widget.
     if (requests.meldSubmitted) return null;
+    // And once the record is past the buyer: the provider approved, or money moved. Only with a
+    // record to read, so a request still being re-opened is not taken for a lapsed one.
+    if (
+      requests.foregroundRecord !== null &&
+      !requests.awaitingDeposit &&
+      !requests.meldAwaitingBuyer
+    ) {
+      return null;
+    }
     const state = lastState.value;
-    const fromRail = state?.phase === "awaiting-deposit" ? state.deposit.payUrl : undefined;
+    // Core reads the rail's first sighting as `swapping`, which a provider filing its transaction
+    // as the form loads reaches before the buyer has paid; the page is still theirs to finish.
+    const fromRail =
+      state?.phase === "awaiting-deposit" || state?.phase === "swapping"
+        ? state.deposit.payUrl
+        : undefined;
     return fromRail ?? meldResumeWidgetUrl.value;
   });
 
@@ -2080,15 +2455,21 @@ export const useSessionStore = defineStore("session", () => {
   function retry() {
     const s = session();
     if (!s) return;
+    trackAction("top-up.retry");
     const confirmed =
       foregroundRef === null ? Promise.resolve(true) : requests.retry(foregroundRef);
     void confirmed.then((ok) => {
       if (!ok) return;
       return s
         .retry()
-        .then(() => console.info(`[coinage] retry() resolved, phase now ${s.getState().phase}`))
+        .then(() => devLog("coinage", `retry() resolved, phase now ${s.getState().phase}`))
         .catch((e: unknown) =>
-          console.error(`[coinage] retry() threw: ${e instanceof Error ? e.message : String(e)}`),
+          devLog(
+            "coinage",
+            `retry() threw: ${e instanceof Error ? e.message : String(e)}`,
+            undefined,
+            "error",
+          ),
         );
     });
   }
@@ -2099,6 +2480,7 @@ export const useSessionStore = defineStore("session", () => {
   async function cancelTopUp(): Promise<boolean> {
     // Declined, not failed: the request still stands.
     if (cancelling.value || requests.claiming || resuming.value || !cancelReady.value) return false;
+    trackAction("top-up.cancel");
     cancelling.value = true;
     cancelNotice.value = null;
     try {
@@ -2111,7 +2493,7 @@ export const useSessionStore = defineStore("session", () => {
           readBurner: () => world.readBurnerDepositOnAh(),
         });
         if (verdict === "refused") {
-          console.warn("[coinage] cancel refused: the burner already holds funds");
+          devLog("coinage", "cancel refused: the burner already holds funds", undefined, "warn");
           driveFunding();
           return false;
         }
@@ -2120,7 +2502,12 @@ export const useSessionStore = defineStore("session", () => {
           // the screen that asked stays put, so it has to say why the cancel didn't take.
           cancelNotice.value =
             "Couldn't confirm this top-up can still be cancelled, so nothing was cancelled. Please try again.";
-          console.warn("[coinage] cancel declined: could not confirm the burner is empty");
+          devLog(
+            "coinage",
+            "cancel declined: could not confirm the burner is empty",
+            undefined,
+            "warn",
+          );
           return false;
         }
       }
@@ -2141,12 +2528,20 @@ export const useSessionStore = defineStore("session", () => {
           if (outcome.outcome === "not-cancellable") {
             cancelNotice.value =
               "Your payment is already on its way and can no longer be cancelled. It will finish on its own.";
-            console.warn("[meld] cancel refused by the adapter: a payment is already in flight");
+            devLog(
+              "meld",
+              "cancel refused by the adapter: a payment is already in flight",
+              undefined,
+              "warn",
+            );
             return false;
           }
         } catch (e) {
-          console.warn(
-            `[meld] adapter cancel failed (cancelling locally anyway): ${e instanceof Error ? e.message : String(e)}`,
+          devLog(
+            "meld",
+            `adapter cancel failed (cancelling locally anyway): ${e instanceof Error ? e.message : String(e)}`,
+            undefined,
+            "warn",
           );
         }
       }
@@ -2167,8 +2562,11 @@ export const useSessionStore = defineStore("session", () => {
           }
         } catch (e) {
           // An unwritable tombstone leaves the record active.
-          console.warn(
-            `[coinage] tombstone write failed (record left as-is): ${e instanceof Error ? e.message : String(e)}`,
+          devLog(
+            "coinage",
+            `tombstone write failed (record left as-is): ${e instanceof Error ? e.message : String(e)}`,
+            undefined,
+            "warn",
           );
         }
       }
@@ -2177,13 +2575,19 @@ export const useSessionStore = defineStore("session", () => {
         if (s) await step("cancel top-up", 20_000, s.cancel());
       } catch (e) {
         // The slot clear is best effort; everything below still detaches the request.
-        console.warn(
-          `[coinage] cancel: core cancel failed (continuing): ${e instanceof Error ? e.message : String(e)}`,
+        devLog(
+          "coinage",
+          `cancel: core cancel failed (continuing): ${e instanceof Error ? e.message : String(e)}`,
+          undefined,
+          "warn",
         );
       }
       teardownWorld();
-      console.warn(
-        `[coinage] top-up cancelled${tradeN !== undefined ? ` (request #${tradeN})` : ""}`,
+      devLog(
+        "coinage",
+        `top-up cancelled${tradeN !== undefined ? ` (request #${tradeN})` : ""}`,
+        undefined,
+        "warn",
       );
       return true;
     } finally {
@@ -2191,30 +2595,36 @@ export const useSessionStore = defineStore("session", () => {
     }
   }
 
-  /** Loads the region dropdown from the adapter's live catalog. On failure `supportedCountries`
-   *  stays null and the screen keeps its static list. */
-  // A destination change invalidates the catalog on screen; reload both for the new one.
-  watch(meldDestination, () => {
-    void loadSupportedCountries();
-    void loadSupportedCorridors();
-  });
-
-  async function loadSupportedCountries(): Promise<void> {
-    const destination = meldDestination.value;
-    const rows = await fetchSupportedCountries(destination);
-    // The destination can change while this is in flight, and the fetches do not return in the
-    // order they were made. Adopting a stale one greys the dropdown by a corridor the quotes are
-    // no longer placed against.
-    if (destination !== meldDestination.value) return;
-    if (rows !== null) supportedCountries.value = rows;
-  }
-
-  // Loads the bulk per-country corridors; only a real catalog is adopted so a cold/empty read greys nothing.
-  async function loadSupportedCorridors(): Promise<void> {
-    const destination = meldDestination.value;
-    const map = await fetchSupportedCorridors(destination);
-    if (destination !== meldDestination.value) return;
-    if (map !== null && map.size > 0) corridorByCountry.value = map;
+  /**
+   * Loads the region dropdown and the per-country corridors from the adapter's live catalogs, one
+   * per token in `catalogDestinations`, read in parallel and merged, the first token's leading. The
+   * countries are the whole catalog: the corridors hold only regions that route something, so a
+   * region listed from them alone would vanish rather than show as unsupported, which is how a
+   * buyer looking for their own country learns why it is not on offer. The corridors grey the list
+   * and carry each region's limits, and stand in for it when no countries read answers. A null or
+   * empty read is no answer, so a cold catalog greys nothing, and when nothing answers
+   * `supportedCountries` stays null and the screen keeps its static list.
+   */
+  async function loadSupportedCatalog(): Promise<void> {
+    const [countryLists, corridorMaps] = await Promise.all([
+      Promise.all(catalogDestinations.map((d) => fetchSupportedCountries(d))),
+      Promise.all(catalogDestinations.map((d) => fetchSupportedCorridors(d))),
+    ]);
+    const rows = countryLists
+      .map((r) => (r !== null && r.length > 0 ? r : null))
+      .reduce(mergeCountries);
+    const corridors = corridorMaps
+      .map((m) => (m !== null && m.size > 0 ? m : null))
+      .reduce(mergeCorridorMaps);
+    if (corridors !== null) corridorByCountry.value = corridors;
+    if (rows !== null) {
+      supportedCountries.value = rows;
+    } else if (corridors !== null) {
+      supportedCountries.value = [...corridors.values()].map((c) => ({
+        country: c.country,
+        name: c.name ?? countryName(c.country),
+      }));
+    }
   }
 
   return {
@@ -2226,6 +2636,8 @@ export const useSessionStore = defineStore("session", () => {
     quoted,
     quoteError,
     quoteFailures,
+    quoteOutOfRange,
+    quoteAmountRejected,
     meldMethodUnavailable,
     supportedCountries,
     corridorByCountry,
@@ -2248,13 +2660,11 @@ export const useSessionStore = defineStore("session", () => {
     recoverRefundKeyFor,
     // derived helpers
     isFaucetConfigured,
-    amountStatus,
     // actions
     setAmount,
     setMethod,
     setMeldCountry,
-    loadSupportedCountries,
-    loadSupportedCorridors,
+    loadSupportedCatalog,
     fetchQuote,
     fetchMeldQuote,
     start,

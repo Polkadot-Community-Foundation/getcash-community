@@ -15,6 +15,11 @@ import {
 } from "../../funding/quote-rows";
 import { creditedAmountOf } from "../../funding/requests/views";
 import { CLOSE, type FailureAction } from "../../funding/timeline/failure";
+import {
+  recoveryPrompt,
+  type PurseWord,
+  type RecoveryAction,
+} from "../../funding/timeline/recovery";
 import { TIMELINE_CADENCE_MS } from "../../funding/timeline/timelines";
 import { TOP_UP_TIMELINE } from "../../funding/timeline/top-up-spec";
 import type { FundingTopUp } from "../../funding/top-ups";
@@ -31,18 +36,27 @@ import DetailRows, { type DetailRow } from "../ui/DetailRows.vue";
 import PillButton from "../ui/PillButton.vue";
 import TransactionIcon from "../ui/TransactionIcon.vue";
 
-const props = defineProps<{
-  /** The top-up as the list knows it; its stored quote backs the detail rows until the request
-   *  is live in the store. */
-  topUp?: FundingTopUp | null;
-}>();
+const props = withDefaults(
+  defineProps<{
+    /** The top-up as the list knows it; its stored quote backs the detail rows until the request
+     *  is live in the store. */
+    topUp?: FundingTopUp | null;
+    /** What the purse holds, for a top-up in recovery: whether it covers the claim's fee decides
+     *  what the band offers. */
+    purse?: PurseWord;
+  }>(),
+  { topUp: null, purse: "unknown" },
+);
 // fees and refund ask the host to swap in their drill-ins; cancel asks it for the cancel
 // confirmation; close leaves the finished journey; startOver asks it to re-enter this route for a
-// fresh attempt at the same top-up.
+// fresh attempt at the same top-up. recoverFromBalance and recoverDeposit are the two ways to pay
+// a trapped top-up's claim fee: the purse, or a deposit on the top-up's own account.
 const emit = defineEmits<{
   fees: [];
   refund: [];
   recover: [];
+  recoverFromBalance: [];
+  recoverDeposit: [];
   cancel: [];
   close: [];
   startOver: [];
@@ -240,9 +254,9 @@ const endedRows = computed<DetailRow[]>(() => [
 /**
  * Cancel, bank only: the provider's pay page can still be withdrawn while no money has arrived.
  *
- * "I've sent funds" does not close it — on this rail that is the buyer's word and not the money,
- * and a transfer they never made would otherwise leave a payable page standing. The confirmation
- * screen carries the warning for the buyer who did already pay.
+ * Reaching the journey does not close it: a transfer the buyer never made would otherwise leave a
+ * payable page standing. The confirmation screen carries the warning for the buyer who did already
+ * pay.
  */
 const canCancel = computed(
   () =>
@@ -271,6 +285,29 @@ const failureAction = computed<FailureAction | null>(() => {
   return needsRequest && requests.foregroundRecord === null ? CLOSE : action;
 });
 
+/** The band's word on a top-up in recovery, read with the purse: the timeline's own prompt knows
+ *  the record alone, and what the purse holds decides which way to the fee is offered. */
+const recovery = computed(() => {
+  const record = requests.foregroundRecord;
+  const prompt = timeline.value?.recovery;
+  return record === null || prompt === undefined ? prompt : recoveryPrompt(record, props.purse);
+});
+/** The ways to pay a trapped top-up's claim fee, the main one first. Both act on the request on
+ *  screen, so a journey opened from history offers none. */
+const recoveryActions = computed<readonly RecoveryAction[]>(() =>
+  requests.foregroundRecord === null ? [] : (recovery.value?.actions ?? []),
+);
+const recoveryLabel = (action: RecoveryAction): string =>
+  action.kind === "send-deposit"
+    ? "Pay fee from another wallet"
+    : action.retry
+      ? "Try again"
+      : "Pay fee";
+function recover(action: RecoveryAction) {
+  if (action.kind === "from-balance") emit("recoverFromBalance");
+  else emit("recoverDeposit");
+}
+
 /** Explains a header amount that moved off the quote. */
 const rateChangeNotice = computed(() =>
   revisedAmount.value
@@ -283,9 +320,13 @@ const rateChangeNotice = computed(() =>
 const timelineMessage = computed(() => {
   if (timeline.value?.failure) return timeline.value.failure.text;
   if (heroFailed.value) return requests.fundingError;
-  return rateChangeNotice.value ?? timeline.value?.message?.text ?? null;
+  return (
+    rateChangeNotice.value ?? recovery.value?.message.text ?? timeline.value?.message?.text ?? null
+  );
 });
-const timelineDetail = computed(() => (heroFailed.value ? null : (timeline.value?.detail ?? null)));
+const timelineDetail = computed(() =>
+  heroFailed.value ? null : (recovery.value?.detail ?? timeline.value?.detail ?? null),
+);
 const { success, successShown, successPlaying, drawn, band } = useJourneySuccess({
   succeeded: finished,
   view: () => timeline.value?.view,
@@ -297,7 +338,7 @@ const { success, successShown, successPlaying, drawn, band } = useJourneySuccess
 <template>
   <!-- The scroller carries -mx-4/px-4 so the timeline card's bleed isn't clipped: overflow-y-auto
        also clips x, and the clip runs at the padding box. -->
-  <div class="-mx-4 flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pb-6">
+  <div class="-mx-4 flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pb-cta">
     <div class="flex flex-col items-center text-center">
       <span
         class="journey-stack size-14 rounded-full"
@@ -373,6 +414,19 @@ const { success, successShown, successPlaying, drawn, band } = useJourneySuccess
       <!-- The reference copies, so the screen carries the confirmation. -->
       <DetailRows v-if="endedRows.length" :rows="endedRows" @fees="emit('fees')" />
       <CopiedPill v-if="endedRows.length" />
+
+      <!-- The ways to pay the claim's fee while the Cash is in People's trap, the main one first,
+           the other way quiet under it. -->
+      <div v-if="recoveryActions.length > 0" class="mt-auto flex flex-col gap-2">
+        <PillButton
+          v-for="(action, index) in recoveryActions"
+          :key="action.kind"
+          :variant="index === 0 ? 'primary' : 'ghost'"
+          @click="recover(action)"
+        >
+          {{ recoveryLabel(action) }}
+        </PillButton>
+      </div>
 
       <!-- The refund guide for money the provider returned to the refund key, the recovery guide
            for money on the top-up's own account. -->

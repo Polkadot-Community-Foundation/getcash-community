@@ -1,7 +1,7 @@
 // Error mapping and idempotency-key behavior of `createMeldClient`.
 
 import { describe, expect, it } from "vitest";
-import { createMeldClient } from "./client";
+import { createMeldClient, isAdapterOutage, refusalOf } from "./client";
 
 /** A fetch stub answering a scripted sequence, one response per call, the last repeating. */
 function stubSequence(responses: readonly { status: number; body: unknown }[]) {
@@ -188,6 +188,41 @@ describe("createMeldClient quote mapping", () => {
   });
 });
 
+describe("isAdapterOutage", () => {
+  const QUOTE_REQ = {
+    country: "US",
+    sourceCurrencyCode: "USD",
+    destinationCurrencyCode: "USDT_DOT",
+    sourceAmount: "50.00",
+    paymentMethodType: "CREDIT_DEBIT_CARD",
+  };
+  const quoteError = (fetchImpl: typeof fetch) =>
+    createMeldClient({ baseUrl: "https://adapter.test", fetchImpl })
+      .getQuote(QUOTE_REQ)
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+  const answering = (status: number, tag: string) => stubFetch(status, { error: { tag } }).impl;
+  const unreachable = (async () => {
+    throw new TypeError("Failed to fetch");
+  }) as unknown as typeof fetch;
+
+  it.each([
+    { name: "no response", fetchImpl: unreachable, outage: true },
+    {
+      name: "Meld not answering the adapter",
+      fetchImpl: answering(503, "ProviderTimeout"),
+      outage: true,
+    },
+    { name: "a throttle", fetchImpl: answering(429, "Other"), outage: true },
+    { name: "no provider quote", fetchImpl: answering(422, "NoQuotesAvailable"), outage: false },
+    { name: "under the minimum", fetchImpl: answering(400, "BelowMinimum"), outage: false },
+  ])("$name: $outage", async ({ fetchImpl, outage }) => {
+    expect(isAdapterOutage(await quoteError(fetchImpl))).toBe(outage);
+  });
+});
+
 describe("createMeldClient status read", () => {
   it("bounds the read with a timeout, so one stalled request cannot hold every poller", async () => {
     const { impl, calls } = stubFetch(200, { funding: { status: "session_opened" } });
@@ -212,6 +247,27 @@ describe("createMeldClient error mapping", () => {
     });
     const client = createMeldClient({ baseUrl: "https://adapter.test", fetchImpl: impl });
     await expect(client.createSession(SESSION_REQ)).rejects.not.toThrow(/quote/i);
+  });
+
+  it("keeps the adapter's tag, code and status on the refusal", async () => {
+    const { impl } = stubFetch(400, {
+      error: {
+        tag: "Other",
+        value: { code: "AMOUNT_REJECTED", message: "The provider cannot take this amount." },
+      },
+    });
+    const client = createMeldClient({ baseUrl: "https://adapter.test", fetchImpl: impl });
+    const refused = await client
+      .getQuote({
+        country: "DE",
+        sourceCurrencyCode: "EUR",
+        destinationCurrencyCode: "DOT",
+        sourceAmount: "50.00",
+        paymentMethodType: "CREDIT_DEBIT_CARD",
+      })
+      .catch((e: unknown) => e);
+    expect(refusalOf(refused)).toEqual({ status: 400, tag: "Other", code: "AMOUNT_REJECTED" });
+    expect(refusalOf(new Error("not a refusal"))).toBeUndefined();
   });
 
   it("names the threshold on BelowMinimum", async () => {

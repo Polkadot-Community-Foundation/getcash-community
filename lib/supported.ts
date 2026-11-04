@@ -236,14 +236,24 @@ export async function fetchSupportedCorridors(
     );
     if (!res.ok) return null;
     const data = (await res.json()) as {
-      corridors?: { country?: string; fiat?: string; methods?: Record<string, unknown>[] }[];
+      corridors?: {
+        country?: string;
+        name?: string;
+        fiat?: string;
+        methods?: Record<string, unknown>[];
+      }[];
     };
     const map = new Map<string, SupportedCorridor>();
     for (const c of data.corridors ?? []) {
       const country = String(c.country ?? "");
       const fiat = String(c.fiat ?? "");
       if (country === "") continue;
-      map.set(country, { country, fiat, methods: (c.methods ?? []).map((m) => toMethod(m, fiat)) });
+      map.set(country, {
+        country,
+        fiat,
+        methods: (c.methods ?? []).map((m) => toMethod(m, fiat)),
+        ...(typeof c.name === "string" && c.name !== "" ? { name: c.name } : {}),
+      });
     }
     // Only a non-empty result is cached; an empty one (cold cache) is retried next call.
     if (map.size > 0) corridorsCache.set(catalogKey(destination, direction), map);
@@ -251,6 +261,92 @@ export async function fetchSupportedCorridors(
   } catch {
     return null;
   }
+}
+
+// A hosted card or bank top-up is delivered in whichever of two tokens a provider quotes, so its
+// region dropdown reads both tokens' buy catalogs as one. `preferred` is the catalog of the token
+// tried first; where the two disagree, its answer is kept.
+
+/** Two country lists as one, each country once and in name order, as the adapter lists them; null
+ *  only when both are. */
+export function mergeCountries(
+  preferred: readonly SupportedCountry[] | null,
+  other: readonly SupportedCountry[] | null,
+): SupportedCountry[] | null {
+  if (other === null) return preferred && [...preferred];
+  if (preferred === null) return [...other];
+  const seen = new Set(preferred.map((c) => c.country));
+  return [...preferred, ...other.filter((c) => !seen.has(c.country))].sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
+}
+
+const DECIMAL = /^(\d+)(?:\.(\d*))?$/;
+
+/** The sign of `a - b` for two plain decimal texts, exactly; null when either is not one. */
+function compareDecimal(a: string, b: string): number | null {
+  const x = DECIMAL.exec(a.trim());
+  const y = DECIMAL.exec(b.trim());
+  if (x === null || y === null) return null;
+  const places = Math.max(x[2]?.length ?? 0, y[2]?.length ?? 0);
+  const scaled = (m: RegExpExecArray) => BigInt(m[1]! + (m[2] ?? "").padEnd(places, "0"));
+  const diff = scaled(x) - scaled(y);
+  return diff === 0n ? 0 : diff < 0n ? -1 : 1;
+}
+
+/** The lower (`sign` -1) or higher (`sign` 1) of two bounds. Blank when either cannot be read: a
+ *  row is greyed on a bound we can read, never on one a side does not give. */
+function widerBound(a: string, b: string, sign: -1 | 1): string {
+  const order = compareDecimal(a, b);
+  if (order === null) return "";
+  return order * sign >= 0 ? a : b;
+}
+
+/**
+ * One country's two corridors as one: a category is routed when either routes it, and where both
+ * do, the first method of each is bounded by the smaller minimum and the larger maximum. Bounds in
+ * two currencies are never mixed: the preferred method's stand.
+ */
+export function mergeCorridor(
+  preferred: SupportedCorridor | null,
+  other: SupportedCorridor | null,
+): SupportedCorridor | null {
+  if (preferred === null || other === null) return preferred ?? other;
+  const first = (corridor: SupportedCorridor, category: SupportedMethodCategory) =>
+    corridor.methods.find((m) => m.category === category);
+  const widened = (method: SupportedMethod): SupportedMethod => {
+    const twin = first(other, method.category);
+    if (method !== first(preferred, method.category) || twin === undefined) return method;
+    if (twin.currency !== method.currency) return method;
+    return {
+      ...method,
+      min: widerBound(method.min, twin.min, -1),
+      max: widerBound(method.max, twin.max, 1),
+      providers: [...new Set([...method.providers, ...twin.providers])],
+    };
+  };
+  return {
+    ...preferred,
+    methods: [
+      ...preferred.methods.map(widened),
+      ...other.methods.filter((m) => first(preferred, m.category) === undefined),
+    ],
+  };
+}
+
+/** Two catalogs' corridors as one, country by country (see `mergeCorridor`); null only when both
+ *  are. */
+export function mergeCorridorMaps(
+  preferred: Map<string, SupportedCorridor> | null,
+  other: Map<string, SupportedCorridor> | null,
+): Map<string, SupportedCorridor> | null {
+  if (preferred === null || other === null) return preferred ?? other;
+  const merged = new Map<string, SupportedCorridor>();
+  for (const country of new Set([...preferred.keys(), ...other.keys()])) {
+    const corridor = mergeCorridor(preferred.get(country) ?? null, other.get(country) ?? null);
+    if (corridor !== null) merged.set(country, corridor);
+  }
+  return merged;
 }
 
 // The off-ramp catalog: the adapter merges Meld's sell routes for every configured lane (today's
@@ -369,6 +465,26 @@ function plainRow(c: SupportedCountry): CountryOption {
 
 // Picker rows for the active method: supported carries its fiat min, unsupported is disabled, and a
 // minimum above `floor` greys the row it belongs to; a null/empty map leaves all rows plain.
+/**
+ * The regions a fiat route's picker lists before `corridorOptions` says what each row can take.
+ *
+ * Both rails list the whole live catalog, so a buyer looking for their own country always finds
+ * it, pickable or greyed under "Unsupported country". Bank needs the corridors to tell a region
+ * with a transfer rail from one without; until they are read it lists the regions known to have
+ * one, rather than a catalog where every row would look pickable. With no live catalog at all,
+ * each rail falls back to its own short list.
+ */
+export function pickerBase(
+  ui: "card" | "bank",
+  catalog: readonly SupportedCountry[] | null,
+  corridors: Map<string, SupportedCorridor> | null,
+  fallback: { card: readonly SupportedCountry[]; bank: readonly SupportedCountry[] },
+): readonly SupportedCountry[] {
+  const live = catalog !== null && catalog.length > 0 ? catalog : null;
+  if (ui === "card") return live ?? fallback.card;
+  return live !== null && corridors !== null && corridors.size > 0 ? live : fallback.bank;
+}
+
 export function corridorOptions(
   base: readonly SupportedCountry[],
   corridors: Map<string, SupportedCorridor> | null,

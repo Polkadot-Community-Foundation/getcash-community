@@ -14,7 +14,9 @@ import {
   type WithdrawNetwork,
 } from "../../withdraw/destinations";
 import PillButton from "../ui/PillButton.vue";
+import ScreenFrame from "../ui/ScreenFrame.vue";
 import SourcePill from "../ui/SourcePill.vue";
+import { devLog } from "~~/lib/log";
 
 const props = defineProps<{
   network: WithdrawNetwork;
@@ -56,14 +58,14 @@ async function paste() {
       return;
     }
   } catch (error: unknown) {
-    console.warn("[withdraw] clipboard read unavailable:", error);
+    devLog("withdraw", "clipboard read unavailable", error, "warn");
   }
   field.value?.focus();
 }
 </script>
 
 <template>
-  <div class="flex min-h-0 flex-1 flex-col">
+  <ScreenFrame>
     <div class="flex justify-center gap-3">
       <SourcePill label="Network" :value="network.label" :icon="network.icon" />
       <SourcePill
@@ -109,15 +111,17 @@ async function paste() {
       </button>
     </div>
 
-    <div class="mt-auto mb-6 flex flex-col gap-4">
-      <p v-if="valid" class="text-center text-body-s text-fg-secondary">
-        Funds sent to the wrong network can't be recovered.
-      </p>
-      <PillButton class="w-full" :disabled="!valid" @click="emit('next', trimmed)">
-        {{ valid ? "Continue" : "Next" }}
-      </PillButton>
-    </div>
-  </div>
+    <template #actions>
+      <div class="flex flex-col gap-4">
+        <p v-if="valid" class="text-center text-body-s text-fg-secondary">
+          Funds sent to the wrong network can't be recovered.
+        </p>
+        <PillButton class="w-full" :disabled="!valid" @click="emit('next', trimmed)">
+          {{ valid ? "Continue" : "Next" }}
+        </PillButton>
+      </div>
+    </template>
+  </ScreenFrame>
 </template>
 
 <style scoped>
