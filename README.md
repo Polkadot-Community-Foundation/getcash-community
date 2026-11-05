@@ -22,8 +22,9 @@ The **surface** (`app/`, `lib/`) is what the user sees. It quotes, shows a depos
 opens the provider's widget, and tracks the request. The **worker** (`worker/`) runs in the
 background inside the host. Once a deposit has landed, the surface hands the job to the
 worker, which converts it to CASH and sends it to the People chain in one transaction on Asset
-Hub (by teleport, or by reserve transfer where the chains do not trust the teleport), then, once
-that CASH is final on People, claims it through the host's top-up call. The top-up is registered
+Hub (by teleport, or by reserve transfer where the chains do not trust the teleport), then, as
+soon as that CASH shows at People's best block, claims it through the host's top-up call, while it
+keeps watching the conversion's block until Asset Hub finalizes it. The top-up is registered
 under the ephemeral account's public key and driven by the host from there.
 The surface shows the top-up done as soon as the host reports the claim in a block; the worker
 follows the host's status over a subscription it holds open until the claim is final, and
@@ -37,8 +38,10 @@ token and the worker signs one `Utility.batch_all` that mints the CASH and sends
 The AssetConversion pool is the fallback, priced at whatever it quotes at the time. It
 takes over whenever the PSM cannot serve a request (i.e.: no instance open for the pair, minting
 paused, the amount over the instance's debt ceiling or under its minimum) and then the provider
-delivers the native token and one XCM swaps and sends it instead. Which tier a request takes
-is decided at quote time, before the provider is told what to send, and recorded on the request
+delivers the native token and one XCM swaps and sends it instead. A Chainflip pick takes the
+pool too when Chainflip cannot quote the swap into USDT for it, and a card or bank top-up when no
+provider buys USDT for the region and amount or the quote for it times out. Which tier a request
+takes is decided at quote time, before the provider is told what to send, and recorded on the request
 with the fee rate it was quoted; the worker runs the tier it is handed and never chooses one.
 On the Polkadot route the token the buyer picks decides: DOT takes the pool, USDT the PSM (the
 pool through PAS when the PSM cannot serve), USDC a stable pool leg, one XCM that exchanges USDC
@@ -78,11 +81,17 @@ the fallback when the PSM cannot serve; the pool sells the CASH for DOT inside t
 stable sells that DOT again on the stable's pool; dotUSD is the CASH sent as it is. Whatever the
 tier, the fee PAS that travels with the CASH ends up in the landing token, so the destination is
 credited one asset.
-The sale is decided at quote time, from the token the user picks for Asset Hub or, for a
-Chainflip or Meld destination, under the on-ramp's fiat rule: USDT through the PSM when it can
-serve, PAS through the pool otherwise. The PSM serves when it has room for the amount plus a tenth
-of it, 20 CASH at the least, once the app's own open PSM withdrawals are counted against that
-room. The sale is frozen on the hand-off, and the worker never re-decides it.
+The sale is decided at quote time, from the token the user picks for Asset Hub or, for a Meld
+destination, from the candidates the off-ramp catalog routes for the region, in this build's lane
+order (USDT on Asset Hub, then PAS, then the Chainflip lanes): a USDT candidate only when the PSM
+can serve it, and the first a provider quotes wins. For a Chainflip destination the chain ranks USDT through the PSM, when it can
+serve, then PAS through the pool, and each destination takes the first of those Chainflip can
+quote for the amount, its minimum included: an amount under Chainflip's minimum for USDT sells
+PAS, and one under the minimum on both shows the smaller. The PSM serves when it has room for the
+amount plus a tenth of it, 20 CASH at the least, once the app's own open PSM withdrawals are
+counted against that room. Confirm decides the sale again, fresh: when it is no longer the one the
+summary showed, the summary takes the new figure and nothing starts until the user confirms that.
+The sale is frozen on the hand-off, and the worker never re-decides it.
 On the PSM tier the XCM makes no sale: it lands the CASH on the key's own Asset Hub account, the
 PAS that travelled sold for CASH, and the key signs one more transaction there, a
 `Utility.batch_all` of `Psm.redeem` and `Assets.transfer_all` of the USDT to the destination, or
@@ -232,14 +241,16 @@ Next. Demo builds, and with them the faucet and Skip, need `"testnet": true`; th
 
 Copy `.env.example` to `.env` and fill in what you need. Nuxt reads `.env`, not `.env.local`.
 
-| Variable                        | Purpose                                                                                                                                                                                       |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `VITE_FAUCET_SEED`              | demo faucet account, holding PAS, dotUSD, USDt and USDC on Asset Hub; inlined into the client bundle, use a testnet account                                                                   |
-| `VITE_DEPLOYER_SEED`            | fallback for `MNEMONIC` in `deploy.sh`                                                                                                                                                        |
-| `VITE_MELD_BASE_URL`            | origin of the Meld adapter; unset, the offline fake Meld client runs instead. Meld's currency codes are read from its `GET /assets` at runtime, never written in this app                     |
-| `VITE_MELD_PRODUCT_ID`          | product id the adapter expects in the `x-dev-product-id` header                                                                                                                               |
-| `VITE_OFFRAMP_LANES`            | card and bank sales: the off-ramp lanes sold through, best first, by asset id (`usdt@assethub,dot@assethub,usdc@arbitrum,usdc@solana`), not Meld code; unset, the direct Asset Hub sales only |
-| `VITE_CHAINFLIP_BROKER_API_KEY` | Broker-as-a-Service key the Chainflip deposit channels open on; unset, the crypto withdrawal destinations show as not available, and so do the crypto sources in a hosted build               |
+| Variable                        | Purpose                                                                                                                                                                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `VITE_FAUCET_SEED`              | demo faucet account, holding PAS, dotUSD, USDt and USDC on Asset Hub; inlined into the client bundle, use a testnet account                                                                                                     |
+| `VITE_DEPLOYER_SEED`            | fallback for `MNEMONIC` in `deploy.sh`                                                                                                                                                                                          |
+| `VITE_MELD_BASE_URL`            | origin of the Meld adapter; unset, the offline fake Meld client runs instead. Meld's currency codes are read from its `GET /assets` at runtime, never written in this app                                                       |
+| `VITE_MELD_PRODUCT_ID`          | product id the adapter expects in the `x-dev-product-id` header                                                                                                                                                                 |
+| `VITE_OFFRAMP_LANES`            | card and bank sales: the off-ramp lanes sold through, best first, by asset id (`usdt@assethub,dot@assethub,usdc@arbitrum,usdc@solana`), not Meld code; unset, the direct Asset Hub sales only                                   |
+| `VITE_CHAINFLIP_BROKER_API_KEY` | Broker-as-a-Service key the Chainflip deposit channels open on; unset, the crypto withdrawal destinations show as not available, and so do the crypto sources in a hosted build                                                 |
+| `VITE_TOP_UP_MINIMUM`           | the least a top up can be, in CASH. Defaults to 1. A value that is zero, negative, under 1 or not an amount is ignored, and the build log says so. A source's own minimum, where it has one, is shown when the source is picked |
+| `VITE_TOP_UP_MAXIMUM`           | the most a top up can be, in CASH. Defaults to 5000, or to the minimum where that is set higher. A value that is zero, negative, not an amount or under the minimum is ignored, and the build log says so                       |
 
 `VITE_CHAINFLIP_BROKER_API_KEY` names an account on Broker-as-a-Service (chainflip-broker.io), one
 key per Chainflip network; this app uses mainnet. Chainflip's own backend refuses to open deposit
@@ -262,7 +273,6 @@ deployment would do. Each is marked `TODO(production)` at its definition:
 - the faucet (`lib/faucet.ts`, `app/utils/demo.ts`), which on Skip sends the burner what the
   Chainflip channel would deliver, in the route's deposit asset, and the `estimateSourceFromCash`
   helper behind the `≈` amounts of the browser world
-- `DEMO_MAX_CASH` in `app/stores/session.ts`, a 200 CASH cap on a purchase
 
 ## Deploy
 
@@ -276,8 +286,39 @@ in `.env.local` or `.env`.
 
 CI does the same: a push to `main` deploys `getcash.paseo`, and every pull request gets a
 preview at `pr<N>-getcash.paseo`. Both are signed with the repository's `MNEMONIC` secret and
-build with `VITE_FAUCET_SEED`, `VITE_MELD_BASE_URL`, `VITE_MELD_PRODUCT_ID` and
-`VITE_CHAINFLIP_BROKER_API_KEY` from repository secrets.
+build with `VITE_FAUCET_SEED`, `VITE_MELD_BASE_URL`, `VITE_MELD_PRODUCT_ID`,
+`VITE_CHAINFLIP_BROKER_API_KEY` and `VITE_SENTRY_DSN` from repository secrets.
+
+## Telemetry
+
+Telemetry is a deployment's opt-in. A build with `VITE_SENTRY_DSN` reports to that Sentry
+project; a build without it carries no Sentry code and makes no request to any Sentry host. The
+SDK is reached only through one guarded dynamic import in `lib/telemetry/index.ts`, which the
+bundler drops when the DSN is unset, and CI fails a DSN-less build whose output still holds any
+Sentry code.
+
+Inside a host, nothing is sent until the person allows Sentry's domain. The app asks for it in a
+request of its own, after its launch prompts have been answered, and holds what it captures until
+then (`lib/telemetry/grant.ts`). A refusal means nothing is sent for that open.
+
+What a deployment with a DSN sends:
+
+- **Failures**, one event of a fixed kind each (`lib/telemetry/catalogue.ts`): a top-up or
+  withdrawal that ended failed, a hand-off the worker refused, a record the host would not store,
+  an unreadable purse, a host that cannot run the build, a quote that could not be had, and
+  unhandled errors.
+- **Journeys**, as spans: the app opening, and each top-up and withdrawal started on the page,
+  step by step (`app/funding/requests/telemetry.ts`).
+- **Counts**: time on each screen and the main actions.
+- **The log**: every `devLog` line (`lib/log.ts`) rides on events as a breadcrumb, and the page's
+  whole log is attached to its first errors. A quiet session sends no log line.
+
+A page the phone or the person killed is not reported on the next open: that cannot be told
+apart from a person leaving, and the worker carries a request on without the page.
+
+Recovery phrases, 32-byte hex values (the shape of a key's entropy, so transaction hashes too)
+and URL queries are scrubbed from everything that leaves the device; the console keeps the line
+as written. Addresses are sent as they are.
 
 ## License
 

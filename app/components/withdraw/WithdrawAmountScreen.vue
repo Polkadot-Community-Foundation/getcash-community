@@ -33,7 +33,10 @@ const canContinue = computed(
     :amount="amount"
     :route="route"
     :available-routes="availableRoutes"
+    :unserved-routes="unservedRoutes"
     :history="history"
+    :history-badge="historyBadge"
+    :back="back"
     :error="error"
     :loading="loading"
     :skeleton="skeleton"
@@ -46,6 +49,7 @@ const canContinue = computed(
     @route="emit('route', $event)"
     @continue="emit('continue')"
     @history="emit('history')"
+    @back="emit('back')"
   >
     <template #default="{ displayAmount }">
       <FundingAmountDisplay class="withdraw-amount" :amount="displayAmount" :caret="!skeleton" />

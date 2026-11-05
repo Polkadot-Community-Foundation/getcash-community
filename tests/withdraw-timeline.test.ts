@@ -9,6 +9,7 @@ import {
   type WithdrawalRecord,
 } from "../app/funding/requests/model";
 import { LINE_LIMIT } from "../app/funding/timeline/model";
+import { delay, normal } from "../app/funding/timeline/route";
 import { requestRefOf } from "../app/utils/request-index";
 import { withdrawalJourneyRows } from "../app/withdraw/timeline/journey-rows";
 import { withdrawalListProgress } from "../app/withdraw/timeline/list";
@@ -805,13 +806,13 @@ describe("withdrawal timeline drawing", () => {
   const drawing = (rec: WithdrawalRecord) =>
     timelineDrawing(WITHDRAWAL_TIMELINE, withdrawalTimeline(rec, { now: at(6) }).view!);
 
-  it("names Started, Received by provider and Sent, heading there first", () => {
+  it("names Started, Received and Sent, heading there first", () => {
     const { milestones } = drawing(record({ status: { kind: "paid", at: at(1), via: "worker" } }));
     expect(milestones.map(({ label }) => label)).toEqual([
       "Started",
       undefined,
       undefined,
-      "Received by provider",
+      "Received",
       undefined,
       undefined,
       "Sent",
@@ -819,14 +820,14 @@ describe("withdrawal timeline drawing", () => {
     expect(milestones.find(({ current }) => current)?.id).toBe("received");
   });
 
-  it("keeps Received by provider's label through the rail's own progress and a failure", () => {
+  it("keeps Received's label through the rail's own progress and a failure", () => {
     const rail = (status: "sending" | "sent") =>
       chainflip({
         status: { kind: "sending", at: at(3) },
         rail: { provider: "chainflip", stage: "processing", status, updatedAt: at(5) },
       });
-    expect(drawing(rail("sending")).milestones[3]!.label).toBe("Received by provider");
-    expect(drawing(rail("sent")).milestones[3]!.label).toBe("Received by provider");
+    expect(drawing(rail("sending")).milestones[3]!.label).toBe("Received");
+    expect(drawing(rail("sent")).milestones[3]!.label).toBe("Received");
     const declined = failed(sale(), "egress-failed", "send", false, {
       rail: {
         provider: "meld",
@@ -836,22 +837,22 @@ describe("withdrawal timeline drawing", () => {
       },
     });
     const { milestones } = drawing(declined);
-    expect(milestones[3]!.label).toBe("Received by provider");
+    expect(milestones[3]!.label).toBe("Received");
     expect(milestones[5]).toMatchObject({
       state: "failed",
       label: "Failed",
       size: "large",
-      labelAlign: "end",
+      labelAlign: "centre",
     });
   });
 
-  it("grows a small milestone that failed and leans its label", () => {
+  it("grows a small milestone that failed, its label centred under it", () => {
     const refused = failed(chainflip(), "rejected", "convert", true);
     expect(drawing(refused).milestones[1]).toMatchObject({
       state: "failed",
       size: "large",
       label: "Failed",
-      labelAlign: "start",
+      labelAlign: "centre",
     });
   });
 });
@@ -1006,5 +1007,48 @@ describe("withdrawal rows", () => {
     expect(row!.progress).toEqual({ value: 0, tone: "waiting", delayed: false });
     const [ready] = projectWithdrawalTopUps([sale({ payment: { attempt: 0 } })], at(1));
     expect(ready!.state).toEqual({ kind: "awaiting-transfer", status: SALE_READY_LABEL });
+  });
+});
+
+describe("withdrawal timeline, band", () => {
+  const worker = (lastTickAt: number): WithdrawalRecord["witnesses"] => ({
+    worker: {
+      known: true,
+      phase: "swap",
+      done: false,
+      fundsSeenAt: at(0),
+      lastTickAt,
+      at: lastTickAt,
+    },
+  });
+
+  it("says what the step is doing, with no detail line", () => {
+    const converting = record({
+      status: { kind: "converting", at: at(1), step: "convert" },
+      witnesses: worker(at(2)),
+    });
+    expect(withdrawalTimeline(converting, { now: at(3) })).toEqual({
+      view: expect.anything(),
+      message: normal("Converting your Cash"),
+    });
+    const handing = chainflip({
+      status: { kind: "sending", at: at(3) },
+      witnesses: worker(at(4)),
+    });
+    expect(withdrawalTimeline(handing, { now: at(5) })).toEqual({
+      view: expect.anything(),
+      message: normal("Handing your money to the exchange"),
+    });
+  });
+
+  it("says a held conversion continues on its own, with no detail line", () => {
+    const stuck = record({
+      status: { kind: "converting", at: at(1), step: "swap" },
+      witnesses: { worker: { ...worker(at(2)).worker!, lastError: "boom" } },
+    });
+    expect(withdrawalTimeline(stuck, { now: at(3) })).toEqual({
+      view: expect.anything(),
+      message: delay("The conversion is taking longer than usual. It will continue automatically."),
+    });
   });
 });

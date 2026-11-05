@@ -5,6 +5,7 @@
 import type { PolkadotClient } from "polkadot-api";
 import { NETWORK } from "@getsome/core";
 import { withTimeout } from "./timeout";
+import { devLog } from "./log";
 
 export const ASSET_HUB_WS = NETWORK.assetHub.rpc;
 export const PEOPLE_WS = NETWORK.people.rpc;
@@ -58,7 +59,7 @@ async function probeHostProvider(target: ChainTarget): Promise<HostProbe> {
     return { provider: null, reason: "not inside a host container" };
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
-    console.warn(`[chain] ${target.label}: host provider unavailable:`, reason);
+    devLog("chain", `${target.label}: host provider unavailable`, reason, "warn");
     return { provider: null, reason };
   }
 }
@@ -105,7 +106,7 @@ async function dialChain(target: ChainTarget): Promise<PolkadotClient> {
       const reason = e instanceof Error ? e.message : String(e);
       throw new Error(`${target.label} chain: host-routed connection failed: ${reason}`);
     }
-    console.info(`[chain] ${target.label}: host-routed provider`);
+    devLog("chain", `${target.label}: host-routed provider`);
     return client;
   }
 
@@ -118,7 +119,7 @@ async function dialChain(target: ChainTarget): Promise<PolkadotClient> {
     client.destroy();
     throw e instanceof Error ? e : new Error(String(e));
   }
-  console.info(`[chain] ${target.label}: direct WebSocket (${target.wsUrl})`);
+  devLog("chain", `${target.label}: direct WebSocket (${target.wsUrl})`);
   return client;
 }
 
@@ -149,5 +150,16 @@ export function evictChains(): void {
   for (const [label, pending] of clientCache) {
     clientCache.delete(label);
     pending.then((client) => client.destroy()).catch(() => {});
+  }
+}
+
+/** Whether the host serves both chains, dialled as every later read will be. The dials stay
+ *  cached for those reads. Never throws: a failure comes back with its reason. */
+export async function checkHostChains(): Promise<{ ok: true } | { ok: false; reason: string }> {
+  try {
+    await Promise.all([connectChain(PEOPLE), connectChain(ASSET_HUB)]);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) };
   }
 }

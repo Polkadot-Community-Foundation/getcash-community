@@ -8,6 +8,7 @@ import {
 import { listHeadline, listProgress, overallProgress } from "../app/funding/timeline/list";
 import { timelineView } from "../app/funding/timeline/model";
 import { TOP_UP_TIMELINE } from "../app/funding/timeline/top-up-spec";
+import { WITHDRAWAL_TIMELINE } from "../app/withdraw/timeline/spec";
 import {
   MILESTONES,
   type MilestoneIndex,
@@ -149,11 +150,11 @@ describe("top-up timeline drawing", () => {
       "centre",
     ],
     [
-      "Sent, grown, its label leaning away from Received",
+      "Sent, grown and centred between its neighbours",
       failedAt(2, 0.4),
       "●●✕○○○○",
       ["complete 1", "failed 0.4", "upcoming 0", "upcoming 0", "upcoming 0", "upcoming 0"],
-      "end",
+      "centre",
     ],
     [
       "Received",
@@ -163,11 +164,11 @@ describe("top-up timeline drawing", () => {
       "centre",
     ],
     [
-      "Converted, grown, its label leaning away from Received",
+      "Converted, grown and centred between its neighbours",
       failedAt(4, 0.5),
       "●●●●✕○○",
       ["complete 1", "complete 1", "complete 1", "failed 0.5", "upcoming 0", "upcoming 0"],
-      "start",
+      "centre",
     ],
     [
       "Added",
@@ -200,6 +201,25 @@ describe("top-up timeline drawing", () => {
     expect(timelineInsets(TOP_UP_TIMELINE)).toEqual({ start: 18.5, end: 16 });
   });
 
+  // A grown ring is 16 px wider, taken only from the two lines beside it
+  it.each([
+    ["a small milestone after Started", failedAt(1, 0), [25.25, 25.25, 22.5, 22.5, 48, 16], 159.5],
+    [
+      "a small milestone after Received",
+      failedAt(4, 0.5),
+      [18.5, 48, 22.5, 27.25, 27.25, 16],
+      159.5,
+    ],
+    ["a labelled milestone", failedAt(3, 0.7), [18.5, 48, 22.5, 22.5, 48, 16], 175.5],
+  ] satisfies [string, TimelineView, number[], number][])(
+    "centres a failure at %s between its neighbours, the rest where the designer put them",
+    (_, view, weights, total) => {
+      const { lines } = timelineDrawing(TOP_UP_TIMELINE, view);
+      expect(lines.map(({ weight }) => weight)).toEqual(weights);
+      expect(lines.reduce((sum, { weight }) => sum + weight, 0)).toBe(total);
+    },
+  );
+
   it("renames a milestone once the drawing reaches the spec's milestone", () => {
     const spec: TimelineSpec = {
       ...TOP_UP_TIMELINE,
@@ -216,6 +236,17 @@ describe("top-up timeline drawing", () => {
     expect(labelAt(current("active", 5, 0.5), 4)).toBe("Converted");
     expect(labelAt(failedAt(6, 0.2))).toBe("Received");
     expect(labelAt(done)).toBe("Received");
+  });
+
+  it("centres the withdrawal's failed label under its milestone", () => {
+    const at = (view: TimelineView, index: number) => {
+      const { label, labelAlign } = timelineDrawing(WITHDRAWAL_TIMELINE, view).milestones[index]!;
+      return `${label} ${labelAlign}`;
+    };
+    expect(at(failedAt(4, 0.5), 4)).toBe("Failed centre");
+    expect(at(failedAt(2, 0.5), 2)).toBe("Failed centre");
+    expect(at(failedAt(5, 0.5), 5)).toBe("Failed centre");
+    expect(at(failedAt(4, 0.5), 3)).toBe("Received centre");
   });
 });
 

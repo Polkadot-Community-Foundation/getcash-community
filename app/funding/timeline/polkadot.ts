@@ -2,16 +2,17 @@
 // 6, their texts, and the failures past the provider's part.
 
 import { cashInText } from "../../utils/cash";
-import { conversionRouteOf, type DepositInBlock, type TopUpRecord } from "../requests/model";
+import type { DepositInBlock, TopUpRecord } from "../requests/model";
 import { mintedOf } from "../requests/views";
 import { CLOSE, TRY_AGAIN, type PartFailure } from "./failure";
 import { earlierFact, factAt } from "./observed";
+import { stepLine } from "./progress";
 import {
   delay,
   normal,
+  withDetail,
   type ProviderPhaseIndex,
   type TextState,
-  type TimelineMessage,
   type TimelineText,
 } from "./route";
 import type {
@@ -174,14 +175,14 @@ export function polkadotPhase(
 export const workerTickAt = (record: TopUpRecord): number | undefined =>
   workerOf(record)?.lastTickAt ?? undefined;
 
-function conversionMessage(record: TopUpRecord): TimelineMessage {
-  if (psmRefused(record)) {
-    return delay("The conversion paused for a moment and will retry automatically");
-  }
-  return normal(
-    conversionRouteOf(record).tier === "dotusd"
-      ? "Getting your Cash ready"
-      : "Converting your money to Cash",
+/** The finalized chain's progress to the deposit's block, as the worker counts it: absent until
+ *  the worker follows the deposit, or when its block was already final. */
+function confirmationLine(inBlock: DepositInBlock | undefined): string | undefined {
+  if (inBlock === undefined || inBlock.block <= inBlock.finalizedAtSeen) return undefined;
+  return stepLine(
+    "Confirmation",
+    Math.max(inBlock.finalized - inBlock.finalizedAtSeen, 0),
+    inBlock.block - inBlock.finalizedAtSeen,
   );
 }
 
@@ -192,20 +193,20 @@ export function polkadotText(
 ): TimelineText {
   switch (index) {
     case 2:
-      return {
-        message: normal(
-          depositOnBurner(record) === undefined
-            ? "Your money is arriving"
-            : "Making sure your money arrived safely",
-        ),
-      };
+      return depositOnBurner(record) === undefined
+        ? { message: normal("Your money is arriving") }
+        : withDetail(normal("We've spotted your deposit"), confirmationLine(record.depositInBlock));
     case 3:
-      return { message: conversionMessage(record) };
+      return {
+        message: psmRefused(record)
+          ? delay("The conversion paused for a moment and will retry automatically")
+          : normal("Converting your money to Cash"),
+      };
     case 4:
       return {
         message: delayed
           ? delay("Your Cash is ready and waiting for the network to confirm it")
-          : normal("Getting your Cash ready"),
+          : normal("Moving your Cash to your account"),
       };
     case 5:
       return {
@@ -222,9 +223,9 @@ const MONEY_SAFE = "Your money is safe, and you won't need to pay again.";
 
 const POLKADOT_FAILURES = {
   held: `We couldn't convert your money to Cash. ${MONEY_SAFE}`,
-  conversionTimeout: `Converting to Cash took too long. ${MONEY_SAFE}`,
+  conversionTimeout: `Converting your money to Cash took too long. ${MONEY_SAFE}`,
   shortfall: `We received less Cash than expected. ${MONEY_SAFE}`,
-  arrivalTimeout: `Getting your Cash ready took too long. ${MONEY_SAFE}`,
+  arrivalTimeout: `Moving your Cash to your account took too long. ${MONEY_SAFE}`,
   notClaimed: `We couldn't add Cash to your balance. ${MONEY_SAFE}`,
 } as const;
 

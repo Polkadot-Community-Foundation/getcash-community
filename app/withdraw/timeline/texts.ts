@@ -2,7 +2,7 @@
 // and the list's words for a sale before its balance is asked.
 
 import { saleAwaitingDeposit, type WithdrawalRecord } from "../../funding/requests/model";
-import { delay, normal, type TextState, type TimelineText } from "../../funding/timeline/route";
+import { delay, normal, type TimelineMessage } from "../../funding/timeline/route";
 
 /** What a fiat sale waits on before its balance is asked: the seller's KYC with the provider. */
 export const SALE_KYC_LABEL = "Waiting for you to finish with the provider";
@@ -66,12 +66,12 @@ function phaseText(record: WithdrawalRecord, index: number): string {
   }
 }
 
-export function withdrawalText(
+/** The band per phase: the rail's delay from the hand-off on, the conversion's before it. */
+export function withdrawalMessage(
   record: WithdrawalRecord,
   index: number,
-  { delayed }: TextState,
-): TimelineText {
-  if (!delayed) return { message: normal(phaseText(record, index)) };
-  // The conversion is phases 0 and 1; from the hand-off on, a delay is the rail's.
-  return { message: delay(index < 2 ? CONVERSION_DELAYED : RAIL_DELAYED) };
+  delayed: boolean,
+): TimelineMessage {
+  if (!delayed) return normal(phaseText(record, index));
+  return delay(index < 2 ? CONVERSION_DELAYED : RAIL_DELAYED);
 }

@@ -19,6 +19,7 @@ import {
   isStablePoolRoute,
   PASEO_PEOPLE_PARA_ID,
   PASEO_UNDERLYING_ASSET_ID,
+  rankRoutes,
   recordedRoute,
   type DepositAsset,
   type FundingStep,
@@ -53,6 +54,7 @@ import {
 } from "./coinage";
 import { ASSET_HUB, ASSET_HUB_GENESIS, connectChain, PEOPLE, PEOPLE_GENESIS } from "./host-chain";
 import type { FundingSizing } from "./funding-fees";
+import { devLog } from "./log";
 
 export interface HostedCoinageWorld extends CoinageWorld {
   /** Current host purse balance (CASH base units). */
@@ -272,9 +274,11 @@ async function lostRequestFees(
     );
     return sizing === null ? defaults : handoffFees(sizing);
   } catch (e) {
-    console.warn(
-      `[coinage] lost request ${sourceId}#${tradeN}: sizing failed, the defaults stand in:`,
+    devLog(
+      "coinage",
+      `lost request ${sourceId}#${tradeN}: sizing failed, the defaults stand in`,
       e,
+      "warn",
     );
     return defaults;
   }
@@ -298,12 +302,25 @@ export async function chooseHostedRoute(
   amount: bigint,
   deposit?: DepositAsset,
 ): Promise<ConversionRoute> {
-  const api = (await connectChain(ASSET_HUB)).getTypedApi(paseo_next_v2);
-  return chooseRoute(api, {
+  return chooseRoute(await routeApi(), {
     direction: "mint",
     internalAmount: amount,
     ...(deposit === undefined ? {} : { deposit }),
   });
+}
+
+/** The conversion tiers a hosted request with no named deposit could take, best first, read off
+ *  the live PSM: a Chainflip pick or a card or bank top-up asks its provider about each in order,
+ *  before any deposit address or provider session exists, and keeps the first it can quote. */
+export async function rankHostedRoutes(
+  amount: bigint,
+): Promise<[ConversionRoute, ...ConversionRoute[]]> {
+  return rankRoutes(await routeApi(), { direction: "mint", internalAmount: amount });
+}
+
+/** Asset Hub's typed API, which the routing rule reads the PSM through. */
+async function routeApi() {
+  return (await connectChain(ASSET_HUB)).getTypedApi(paseo_next_v2);
 }
 
 /** The funded session over the real host seams; budget sized live for the route's tier. */
@@ -349,9 +366,9 @@ export function ensureChainSubmitGrant(): Promise<void> {
   chainSubmitGranted ??= (async () => {
     try {
       const r = await requestPermission({ tag: "ChainSubmit", value: undefined });
-      console.info("[coinage] ChainSubmit grant:", r.ok ? "granted" : r.error?.message);
+      devLog("coinage", "ChainSubmit grant", r.ok ? "granted" : r.error?.message);
     } catch (e) {
-      console.warn("[coinage] ChainSubmit request failed (continuing):", e);
+      devLog("coinage", "ChainSubmit request failed (continuing)", e, "warn");
     }
   })();
   return chainSubmitGranted;
@@ -368,24 +385,23 @@ export async function startLiveCoinage(args: {
   const world = await createHostedCoinageWorld({ amount, route: await chooseHostedRoute(amount) });
 
   world.session.subscribe((s) => {
-    console.info(`[coinage] phase=${s.phase}`, s);
+    devLog("coinage", `phase=${s.phase}`, s);
     if (s.phase === "awaiting-deposit") {
-      console.info(
-        `[coinage] send exactly ${s.deposit.formatted} ${s.deposit.assetSymbol} to ${s.deposit.address} on Asset Hub`,
+      devLog(
+        "coinage",
+        `send exactly ${s.deposit.formatted} ${s.deposit.assetSymbol} to ${s.deposit.address} on Asset Hub`,
       );
     }
   });
 
   await world.session.ready;
   const quote = await world.session.quote();
-  console.info(
-    `[coinage] quoted native budget: ${quote.source.formatted} ${quote.source.assetSymbol}`,
-  );
+  devLog("coinage", `quoted native budget: ${quote.source.formatted} ${quote.source.assetSymbol}`);
   const { refundAddress } = world;
   await world.session.start(refundAddress === null ? {} : { refundAddress });
   void world.runFunding({
-    onStep: (step: FundingStep) => console.info(`[coinage] funding step: ${step}`),
-    onTransientError: (e) => console.warn("[coinage] funding transient:", e),
+    onStep: (step: FundingStep) => devLog("coinage", `funding step: ${step}`),
+    onTransientError: (e) => devLog("coinage", "funding transient", e, "warn"),
   });
   return world;
 }

@@ -7,26 +7,31 @@
 // with it.
 //
 // Nothing here can see whether the transfer was actually made — the provider only learns of it
-// when the money lands — so "I've sent funds" is the buyer's word. It waits out a short countdown
-// first, because the details behind it take longer to read than the button takes to reach.
+// when the money lands — so the screen stays on the details until the provider reports the payment
+// moving, and the status poll hands the top-up to the journey. Back leaves it running in the list.
 //
 // A price that could not be had takes the summary step whole, in the two steps every quote
 // screen shows: a retry, then a change of country or of rail.
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, ref } from "vue";
 import { ChevronRight, CircleAlert } from "lucide-vue-next";
-import { methodMinimum, namedCountry, otherMethod } from "~~/lib/supported";
+import { isMethodDown, methodMinimum, namedCountry } from "~~/lib/supported";
 import { useRequestsStore } from "../../../stores/requests";
 import { useSessionStore } from "../../../stores/session";
 import { currencyConfig } from "../../../funding/config";
 import { fmtFiat, isMoneyAmount } from "../../../utils/money";
+import { fiatAmountRejected, fiatOutOfRange } from "../../../funding/out-of-range";
+import { sessionFailed } from "../../../funding/session-failure";
 import type { FundingRoute } from "../../../funding/selection";
 import CashAmount from "../../ui/CashAmount.vue";
 import PillButton from "../../ui/PillButton.vue";
 import RateErrorScreen from "../../ui/RateErrorScreen.vue";
 import RegionRow from "../../ui/RegionRow.vue";
+import ScreenFrame from "../../ui/ScreenFrame.vue";
 import SkeletonBlock from "../../ui/SkeletonBlock.vue";
+import AmountOutOfRange from "../AmountOutOfRange.vue";
 import MethodUnavailable from "../MethodUnavailable.vue";
 import MeldPaySheet from "./MeldPaySheet.vue";
+import { devLog } from "~~/lib/log";
 
 const props = defineProps<{
   /** The region the quote is priced in, as an ISO 3166-1 alpha-2 code. */
@@ -47,6 +52,7 @@ const emit = defineEmits<{
   /** Leave the screen without touching the request: a lapsed transfer may still be arriving. */
   leave: [];
   switchRoute: [route: FundingRoute];
+  changeAmount: [];
 }>();
 
 const session = useSessionStore();
@@ -57,7 +63,13 @@ const blocked = computed(() => session.quoteError !== null && !session.loading);
 /** A request exists: the provider has a pay page for this quote. */
 const requestOpen = computed(() => requests.phase !== null);
 /** The summary has nothing to price yet. */
-const pricing = computed(() => !blocked.value && !session.quoted);
+const pricing = computed(
+  () =>
+    !blocked.value &&
+    session.quoteOutOfRange === null &&
+    !session.quoteAmountRejected &&
+    !session.quoted,
+);
 
 /** The hero: the exact total to transfer, fees included. Shown only once a quote priced it. */
 const heroAmount = computed(() => {
@@ -98,9 +110,13 @@ async function openRequest() {
   try {
     await session.start();
   } catch (e) {
-    console.warn("[meld] could not open the transfer:", e);
-    startError.value =
-      e instanceof Error ? e.message : "Could not open the transfer. Please try again.";
+    devLog("meld", "could not open the transfer", e, "warn");
+    startError.value = sessionFailed(e, {
+      side: "buy",
+      method: "bank",
+      country: countryLabel.value,
+      provider: session.quoted?.provider,
+    });
   } finally {
     starting.value = false;
   }
@@ -115,60 +131,10 @@ function requote() {
   startError.value = null;
   void session.fetchMeldQuote();
 }
-
-/** How long the confirmation waits, in seconds, from the moment the details are on screen. */
-const CONFIRM_DELAY_S = 5;
-/** Seconds still to wait; 0 once the confirmation is the buyer's to give. */
-const countdown = ref(CONFIRM_DELAY_S);
-let countdownTimer: ReturnType<typeof setInterval> | null = null;
-function stopCountdown() {
-  if (countdownTimer !== null) clearInterval(countdownTimer);
-  countdownTimer = null;
-}
-/** Runs once per pay page: a page that reloads under the buyer does not restart their wait. */
-function startCountdown() {
-  if (countdownTimer !== null || countdown.value === 0) return;
-  countdownTimer = setInterval(() => {
-    countdown.value -= 1;
-    if (countdown.value <= 0) stopCountdown();
-  }, 1_000);
-}
-/** The pay page the wait was served for. Tracked as the last URL seen, not the watch's previous
- *  value: two requests are always separated by a null gap (the cancel tears the page down), so a
- *  plain old-vs-new comparison would read the second one as the first. */
-let waitedFor: string | null = null;
-watch(
-  () => (props.step === "details" ? session.meldPayUrl : null),
-  (url) => {
-    if (url === null) return;
-    if (waitedFor !== null && url !== waitedFor) {
-      // A new request behind the same mounted screen: new account, new amount — the wait is owed
-      // again. The same page seen again (Back, then Continue) keeps the wait already served.
-      stopCountdown();
-      countdown.value = CONFIRM_DELAY_S;
-    }
-    waitedFor = url;
-    startCountdown();
-  },
-  { immediate: true },
-);
-onUnmounted(stopCountdown);
-
-/**
- * The buyer's word that the transfer is on its way. The provider cannot see an inbound transfer
- * until it lands, so this is the same handoff the card widget posts for itself: it moves the
- * top-up onto the journey, where the status poll takes over.
- */
-const canConfirm = computed(
-  () =>
-    countdown.value === 0 &&
-    !requests.meldSubmitted &&
-    session.meldPayUrl !== null &&
-    !requests.claiming,
-);
-function confirmSent() {
-  if (!canConfirm.value) return;
-  void session.markMeldSubmitted();
+// Out of range: the bound the method takes, in CASH, becomes the amount and is quoted.
+function useAmount(cash: string) {
+  session.setAmount(cash);
+  requote();
 }
 </script>
 
@@ -182,10 +148,26 @@ function confirmSent() {
       :country="country"
       :country-name="countryLabel"
       :minimum="methodMinimum(session.meldCorridor, 'bank')"
-      :other="otherMethod(session.meldCorridor, 'bank')"
+      :temporarily="isMethodDown(session.meldCorridor, 'bank')"
       @region="emit('currency')"
       @use-crypto="emit('switchRoute', 'crypto')"
-      @use-other="emit('switchRoute', 'card')"
+    />
+    <AmountOutOfRange
+      v-else-if="step === 'summary' && session.quoteOutOfRange !== null && !session.loading"
+      :amount="session.amountHuman"
+      :words="fiatOutOfRange(session.quoteOutOfRange, 'bank', countryLabel)"
+      :region="{ label: 'Payment country', value: countryLabel, country }"
+      @region="emit('currency')"
+      @change-amount="emit('changeAmount')"
+      @use-amount="useAmount"
+    />
+    <AmountOutOfRange
+      v-else-if="step === 'summary' && session.quoteAmountRejected && !session.loading"
+      :amount="session.amountHuman"
+      :words="fiatAmountRejected('bank', countryLabel)"
+      :region="{ label: 'Payment country', value: countryLabel, country }"
+      @region="emit('currency')"
+      @change-amount="emit('changeAmount')"
     />
     <RateErrorScreen
       v-else-if="step === 'summary' && blocked"
@@ -194,7 +176,7 @@ function confirmSent() {
       @change-country="emit('currency')"
       @use-crypto="emit('switchRoute', 'crypto')"
     />
-    <template v-else-if="step === 'summary'">
+    <ScreenFrame v-else-if="step === 'summary'">
       <!-- The hero, pricing or priced. -->
       <div class="flex shrink-0 flex-col items-center text-center">
         <template v-if="pricing">
@@ -249,12 +231,14 @@ function confirmSent() {
         </div>
       </div>
 
-      <SkeletonBlock v-if="pricing" class="mt-auto h-12 w-full shrink-0" />
-      <PillButton v-else class="mt-auto w-full shrink-0" @click="onContinue"> Continue </PillButton>
-      <PoweredBy class="mt-3 mb-4" provider="Meld" />
-    </template>
+      <template #actions>
+        <SkeletonBlock v-if="pricing" class="h-12 w-full" />
+        <PillButton v-else class="w-full" @click="onContinue">Continue</PillButton>
+        <PoweredBy provider="Meld" />
+      </template>
+    </ScreenFrame>
 
-    <template v-else>
+    <ScreenFrame v-else>
       <!-- The provider's page, and nothing of ours over it: the account to pay is on it. -->
       <div
         class="flex min-h-0 flex-1 flex-col overflow-clip rounded-container bg-surface-container"
@@ -288,29 +272,25 @@ function confirmSent() {
         {{ session.cancelNotice }}
       </p>
 
-      <div class="mt-6 mb-6 flex shrink-0 flex-col gap-3">
-        <PillButton v-if="startError" class="w-full" @click="openRequest">Try again</PillButton>
-        <!-- Nothing left to confirm on a lapsed transfer, and nothing to cancel either: a
+      <template #actions>
+        <div class="flex flex-col gap-3 pt-6">
+          <PillButton v-if="startError" class="w-full" @click="openRequest">Try again</PillButton>
+          <!-- Nothing left to confirm on a lapsed transfer, and nothing to cancel either: a
              transfer already sent still arrives, so this only leaves the screen. -->
-        <PillButton v-else-if="lapsed" class="w-full" @click="emit('leave')">
-          Back to top-ups
-        </PillButton>
-        <!-- The count is on the button, so the wait is visibly the button's and not a failure. -->
-        <PillButton v-else class="w-full" :disabled="!canConfirm" @click="confirmSent">
-          <!-- A non-breaking space: the compiler condenses a plain one away, and the count must
-               not wrap off the label either. -->
-          I’ve sent funds<template v-if="countdown > 0">&nbsp;{{ countdown }}</template>
-        </PillButton>
-        <!-- A resumed transfer's way out: nothing can have been taken while this screen is up. -->
-        <PillButton
-          v-if="cancellable && !lapsed && !startError"
-          variant="danger"
-          class="w-full"
-          @click="emit('cancel')"
-        >
-          Cancel
-        </PillButton>
-      </div>
-    </template>
+          <PillButton v-else-if="lapsed" class="w-full" @click="emit('leave')">
+            Back to top-ups
+          </PillButton>
+          <!-- A resumed transfer's way out: nothing can have been taken while this screen is up. -->
+          <PillButton
+            v-if="cancellable && !lapsed && !startError"
+            variant="danger"
+            class="w-full"
+            @click="emit('cancel')"
+          >
+            Cancel
+          </PillButton>
+        </div>
+      </template>
+    </ScreenFrame>
   </div>
 </template>

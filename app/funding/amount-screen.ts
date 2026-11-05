@@ -11,7 +11,13 @@ export interface AmountScreenProps {
   route: FundingRoute | null;
   /** Routes this build can run. Any other renders dimmed, marked "Soon", and unclickable. */
   availableRoutes?: readonly FundingRoute[];
+  /** Routes this build runs but the backend cannot serve right now: dimmed and never selected,
+   *  and a tap says why for a few seconds instead of a "Soon" mark. */
+  unservedRoutes?: readonly FundingRoute[];
   history: boolean;
+  /** A top-up or send still running: the clock wears a dot, and Back returns to its screen. */
+  historyBadge?: boolean;
+  back?: boolean;
   error?: string | null;
   loading?: boolean;
   /** Launch-load placeholder: static chrome renders inert, data-driven parts show skeletons. */
@@ -28,6 +34,7 @@ export interface AmountScreenEmits {
   route: [route: FundingRoute];
   continue: [];
   history: [];
+  back: [];
 }
 
 export type AmountScreenComponent = Component<AmountScreenProps>;
