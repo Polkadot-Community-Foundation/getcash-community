@@ -14,6 +14,7 @@ import type { ScreenName } from "~~/lib/telemetry";
 import { useStateDirector } from "../../../composables/useStateDirector";
 import { psmReserved, useWithdrawalRequest } from "../../../composables/useWithdrawalRequest";
 import type { FundingPackageEmits } from "../../../funding/handoff";
+import { sessionFailed } from "../../../funding/session-failure";
 import { paymentTaken, saleAwaitingDeposit } from "../../../funding/requests/model";
 import type { FundingSelection } from "../../../funding/selection";
 import type { FundingTopUp } from "../../../funding/top-ups";
@@ -30,10 +31,9 @@ import { bankRailCountries } from "~~/lib/region";
 import {
   corridorOptions,
   countryName,
+  isMethodDown,
   methodMinimum,
-  otherMethod,
   namedCountry,
-  type SupportedCountry,
 } from "~~/lib/supported";
 import CurrencySelectScreen from "../../funding/routes/CurrencySelectScreen.vue";
 import ScreenShell from "../../ui/ScreenShell.vue";
@@ -140,16 +140,8 @@ function onBack() {
   }
 }
 
-/** Fallback region list, for when the adapter's live catalog is unreachable. */
-const FALLBACK_COUNTRIES: SupportedCountry[] = [
-  { country: "DE", name: "Germany" },
-  { country: "FR", name: "France" },
-  { country: "GB", name: "United Kingdom" },
-  { country: "US", name: "United States" },
-];
-
-/** The regions this method pays out in: the live catalog's, else the fallback; a bank payout
- *  only where the country has a rail. */
+/** The regions this method pays out in, from the live catalog; a bank payout only where the
+ *  country has a rail. Null while the catalog is unread. */
 const pickerCountries = computed(() => {
   const live = sale.countries.value;
   const named = new Map((live ?? []).map((c) => [c.country, c.name]));
@@ -158,9 +150,7 @@ const pickerCountries = computed(() => {
       ? bankRailCountries()
           .map((country) => ({ country, name: named.get(country) ?? countryName(country) }))
           .sort((a, b) => a.name.localeCompare(b.name))
-      : live && live.length > 0
-        ? live
-        : FALLBACK_COUNTRIES;
+      : (live ?? []);
   return corridorOptions(base, sale.corridors.value, method);
 });
 
@@ -181,8 +171,6 @@ const detectedCountry = computed(() => {
 const countryLabel = computed(() => namedCountry(sale.country.value, sale.countries.value));
 const corridor = computed(() => sale.corridors.value?.get(sale.country.value) ?? null);
 const minimum = computed(() => methodMinimum(corridor.value, method));
-/** The other fiat method, when the payout country routes it and not this one. */
-const switchMethod = computed(() => otherMethod(corridor.value, method));
 
 function pickCountry(country: string) {
   step.value = "quote";
@@ -279,7 +267,12 @@ async function confirm() {
     followSale(outcome.ref);
     step.value = "kyc";
   } catch (error: unknown) {
-    startError.value = error instanceof Error ? error.message : String(error);
+    startError.value = sessionFailed(error, {
+      side: "sell",
+      method,
+      country: countryLabel.value,
+      provider: quoted.line.serviceProvider,
+    });
   } finally {
     starting.value = false;
   }
@@ -527,10 +520,12 @@ onUnmounted(() => {
     <CurrencySelectScreen
       v-else-if="step === 'region'"
       :options="pickerCountries"
+      :loading="sale.catalogLoading.value"
       :model-value="sale.country.value"
       :detected="detectedCountry"
       placeholder="Search for a country"
       @pick="pickCountry"
+      @retry="sale.loadCatalog()"
     />
     <MeldSellQuoteScreen
       v-else-if="step === 'quote' || step === 'fees'"
@@ -542,7 +537,7 @@ onUnmounted(() => {
       :error-kind="sale.errorKind.value"
       :rate-failures="sale.rateFailures.value"
       :minimum="minimum"
-      :other="switchMethod"
+      :temporarily="isMethodDown(corridor, method)"
       :country="countryDecided ? sale.country.value : null"
       :country-name="countryDecided ? countryLabel : null"
       :starting="starting"
@@ -552,7 +547,6 @@ onUnmounted(() => {
       @region="step = 'region'"
       @retry="retryQuote"
       @use-crypto="emit('switchRoute', 'crypto')"
-      @use-other="switchMethod && emit('switchRoute', switchMethod)"
     />
     <WithdrawCancelScreen
       v-else-if="step === 'cancel'"

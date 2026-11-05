@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { trackAction } from "~~/lib/telemetry";
 import FundingAmountScreen from "./FundingAmountScreen.vue";
 import type { AmountScreenComponent } from "../../funding/amount-screen";
@@ -13,6 +13,7 @@ import {
 import {
   createFundingSelection,
   isFundingRouteAvailable,
+  selectableRoute,
   type FundingRoute,
   type FundingSelection,
 } from "../../funding/selection";
@@ -40,6 +41,8 @@ const props = withDefaults(
     /** Routes this build can run; the rest render dimmed and cannot be picked. Defaults to
      *  every configured route. */
     availableRoutes?: readonly FundingRoute[] | null;
+    /** Routes the backend cannot serve right now; see `AmountScreenProps`. */
+    unservedRoutes?: readonly FundingRoute[];
     error?: string | null;
     loading?: boolean;
     topUps?: readonly InProgressFundingTopUp[];
@@ -66,6 +69,7 @@ const props = withDefaults(
     config: () => fundingSelectorConfig,
     initialSelection: null,
     availableRoutes: null,
+    unservedRoutes: () => [],
     error: null,
     loading: false,
     topUps: () => [],
@@ -90,7 +94,13 @@ const emit = defineEmits<{
   change: [];
   continue: [selection: FundingSelection];
   openTopUp: [topUp: OpenableFundingTopUp, target: FundingTopUpReturnTarget];
+  /** The interactive shell is on screen: the caller reads what the routes can serve again. */
+  opened: [];
 }>();
+
+onMounted(() => {
+  if (!props.skeleton) emit("opened");
+});
 
 const amountScreen = computed<AmountScreenComponent>(
   () => props.amountScreen ?? FundingAmountScreen,
@@ -110,7 +120,19 @@ const amount = ref(props.initialSelection?.amount ?? props.config.amount.initial
 // A buyer returning from a package keeps their route; a fresh entry starts on the configured
 // default. Either one starts unpicked when this build cannot run it.
 const initialRoute = props.initialSelection?.route ?? props.config.defaultRoute;
-const route = ref<FundingRoute | null>(isRouteAvailable(initialRoute) ? initialRoute : null);
+const route = ref(selectableRoute(initialRoute, props.availableRoutes));
+
+// The backend can stop serving the selected route while the screen is up, when the catalog lands
+// or is read again; the pills say why.
+watch(
+  () => props.availableRoutes,
+  (available) => {
+    const next = selectableRoute(route.value, available);
+    if (next === route.value) return;
+    route.value = next;
+    emit("change");
+  },
+);
 
 function changeAmount(next: string) {
   amount.value = next;
@@ -233,6 +255,7 @@ watch(
       :amount="amount"
       :route="route"
       :available-routes="availableRoutes ?? undefined"
+      :unserved-routes="unservedRoutes"
       :history="hasHistoryContent"
       :history-badge="hasTopUpInProgress"
       :back="hasTopUpInProgress"

@@ -14,12 +14,13 @@
 // screen shows: a retry, then a change of country or of rail.
 import { computed, ref } from "vue";
 import { ChevronRight, CircleAlert } from "lucide-vue-next";
-import { methodMinimum, namedCountry, otherMethod } from "~~/lib/supported";
+import { isMethodDown, methodMinimum, namedCountry } from "~~/lib/supported";
 import { useRequestsStore } from "../../../stores/requests";
 import { useSessionStore } from "../../../stores/session";
 import { currencyConfig } from "../../../funding/config";
 import { fmtFiat, isMoneyAmount } from "../../../utils/money";
 import { fiatAmountRejected, fiatOutOfRange } from "../../../funding/out-of-range";
+import { sessionFailed } from "../../../funding/session-failure";
 import type { FundingRoute } from "../../../funding/selection";
 import CashAmount from "../../ui/CashAmount.vue";
 import PillButton from "../../ui/PillButton.vue";
@@ -110,8 +111,12 @@ async function openRequest() {
     await session.start();
   } catch (e) {
     devLog("meld", "could not open the transfer", e, "warn");
-    startError.value =
-      e instanceof Error ? e.message : "Could not open the transfer. Please try again.";
+    startError.value = sessionFailed(e, {
+      side: "buy",
+      method: "bank",
+      country: countryLabel.value,
+      provider: session.quoted?.provider,
+    });
   } finally {
     starting.value = false;
   }
@@ -143,10 +148,9 @@ function useAmount(cash: string) {
       :country="country"
       :country-name="countryLabel"
       :minimum="methodMinimum(session.meldCorridor, 'bank')"
-      :other="otherMethod(session.meldCorridor, 'bank')"
+      :temporarily="isMethodDown(session.meldCorridor, 'bank')"
       @region="emit('currency')"
       @use-crypto="emit('switchRoute', 'crypto')"
-      @use-other="emit('switchRoute', 'card')"
     />
     <AmountOutOfRange
       v-else-if="step === 'summary' && session.quoteOutOfRange !== null && !session.loading"
