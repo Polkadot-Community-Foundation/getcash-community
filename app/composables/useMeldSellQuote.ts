@@ -4,7 +4,7 @@
 // what the sale sells and in which order they are tried; the chain decides, per candidate, whether
 // it can serve the sale and sizes the figure.
 
-import { ref, shallowRef, toValue, watch, type MaybeRefOrGetter } from "vue";
+import { computed, ref, shallowRef, toValue, watch, type MaybeRefOrGetter } from "vue";
 import { meldAssetOf, type MeldAssetId } from "@getsome/core";
 import {
   directSellToken,
@@ -175,6 +175,23 @@ export function sellableCorridor(
   return { ...corridor, methods };
 }
 
+/** Meld's codes for the assets a sale names, read once from the adapter the sale goes through. */
+async function assetsRead(): Promise<void> {
+  const client = meldSellClient();
+  if (client !== null) await ensureMeldAssets(client);
+}
+
+/** The off-ramp catalog cut down to the lanes this build sells; null when it cannot be read. */
+export async function readSellableCorridors(): Promise<Map<string, SupportedCorridor> | null> {
+  // Unread, a lane is matched by the asset the adapter names for it, and one it names none for
+  // is not sold; the quote asks again.
+  await assetsRead().catch(() => undefined);
+  const fetched = await fetchOfframpCorridors();
+  return (
+    fetched && new Map([...fetched].map(([cc, c]) => [cc, sellableCorridor(c, OFFRAMP_LANE_ORDER)]))
+  );
+}
+
 /** `reserved` is the CASH this app's other PSM withdrawals have yet to redeem, which the PSM's room
  *  is judged without for every candidate. */
 export function useMeldSellQuote(
@@ -188,8 +205,16 @@ export function useMeldSellQuote(
   watch(country, (next) => {
     lastCountry = next;
   });
-  const countries = shallowRef<SupportedCountry[] | null>(null);
   const corridors = shallowRef<Map<string, SupportedCorridor> | null>(null);
+  const countries = computed<SupportedCountry[] | null>(
+    () =>
+      corridors.value &&
+      [...corridors.value.values()].map((c) => ({
+        country: c.country,
+        name: c.name ?? countryName(c.country),
+      })),
+  );
+  const catalogLoading = ref(false);
   const quote = shallowRef<MeldSellQuote | null>(null);
   const loading = ref(false);
   const error = ref<string | null>(null);
@@ -210,31 +235,20 @@ export function useMeldSellQuote(
     });
   }
 
-  /** Meld's codes for the assets a sale names, read once from the adapter the sale goes through. */
-  async function assetsRead(): Promise<void> {
-    const client = meldSellClient();
-    if (client !== null) await ensureMeldAssets(client);
+  /** The off-ramp catalog, for the region picker. Null until a read succeeds. */
+  async function loadCatalog(): Promise<void> {
+    catalogLoading.value = true;
+    try {
+      await readCatalog();
+    } finally {
+      catalogLoading.value = false;
+    }
   }
 
-  /** The off-ramp catalog, for the region picker. Null lists when discovery is unreachable. */
-  async function loadCatalog(): Promise<void> {
-    // Unread, a lane is matched by the asset the adapter names for it, and one it names none for
-    // is not sold; the quote below asks again.
-    await assetsRead().catch(() => undefined);
-    const fetched = await fetchOfframpCorridors();
-    // Only the lanes this build sells: a region routed by none of them is greyed, not offered.
-    const routed =
-      fetched === null
-        ? null
-        : new Map([...fetched].map(([cc, c]) => [cc, sellableCorridor(c, OFFRAMP_LANE_ORDER)]));
-    corridors.value = routed;
-    countries.value =
-      routed === null
-        ? null
-        : [...routed.values()].map((c) => ({
-            country: c.country,
-            name: c.name ?? countryName(c.country),
-          }));
+  async function readCatalog(): Promise<void> {
+    const read = await readSellableCorridors();
+    // A failed read keeps the last list.
+    if (read !== null) corridors.value = read;
   }
 
   /**
@@ -249,7 +263,8 @@ export function useMeldSellQuote(
     const live = read === null ? null : sellableCorridor(read, OFFRAMP_LANE_ORDER);
     if (live !== null) {
       const found = methodFor(live, method);
-      return found === null
+      // A method whose providers all fail the adapter's probes is not quoted until they answer.
+      return found === null || found.temporarilyUnavailable
         ? null
         : {
             fiat: live.fiat,
@@ -267,7 +282,10 @@ export function useMeldSellQuote(
   function failUnrouted(): void {
     const routedAnywhere =
       corridors.value === null ||
-      [...corridors.value.values()].some((c) => methodFor(c, method) !== null);
+      [...corridors.value.values()].some((c) => {
+        const found = methodFor(c, method);
+        return found !== null && !found.temporarilyUnavailable;
+      });
     if (routedAnywhere) {
       fail(
         "unrouted",
@@ -384,6 +402,7 @@ export function useMeldSellQuote(
     chosenBefore,
     countries,
     corridors,
+    catalogLoading,
     quote,
     loading,
     error,
