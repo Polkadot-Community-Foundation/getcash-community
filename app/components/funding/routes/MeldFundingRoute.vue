@@ -4,10 +4,10 @@
 // the provider's details for the buyer to pay from their own banking app. Both hand off to the
 // journey once the payment is approved, asserted, or fails.
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { bankRailCountries } from "~~/lib/region";
-import { corridorOptions, countryName, type CountryOption } from "~~/lib/supported";
+import { corridorOptions, type CountryOption } from "~~/lib/supported";
 import { detectCountry, useDetectedCountry } from "../../../composables/useDetectedCountry";
 import { useMeldHandoff } from "../../../composables/useMeldHandoff";
+import { useScreen } from "../../../composables/useScreen";
 import { useStateDirector } from "../../../composables/useStateDirector";
 import { useVisibilityReconcile } from "../../../composables/useVisibilityReconcile";
 import { fundingSelectorConfig } from "../../../funding/config";
@@ -24,6 +24,9 @@ import MeldBankTransferScreen from "./MeldBankTransferScreen.vue";
 import MeldFeeDetailsScreen from "./MeldFeeDetailsScreen.vue";
 import MeldPayScreen from "./MeldPayScreen.vue";
 import MeldPaySheet from "./MeldPaySheet.vue";
+import ScreenFrame from "../../ui/ScreenFrame.vue";
+import ScreenShell from "../../ui/ScreenShell.vue";
+import WidgetCancel from "../../ui/WidgetCancel.vue";
 
 const props = defineProps<{ selection: FundingSelection }>();
 const emit = defineEmits<FundingPackageEmits>();
@@ -90,6 +93,13 @@ function goBack() {
 }
 /** The widget stage, card only: a request exists and the payment is still to be made. */
 const paying = computed(() => !isBank && flow.screen === "journey");
+useScreen(() => {
+  if (session.resuming) return null;
+  if (showingCurrency.value) return "region";
+  if (showingFees.value) return "fees";
+  if (paying.value) return "top-up.card.widget";
+  return isBank ? "top-up.bank" : "top-up.card";
+});
 // The widget supersedes the drill-in (its template branch wins). Without this, a flow that moves
 // on while the fee screen is up leaves the flag set, and the next Back tap is silently spent
 // clearing it instead of leaving.
@@ -99,9 +109,16 @@ watch(paying, (now) => {
   showingCurrency.value = false;
 });
 /** Cancel is offered only while nothing can have been paid. Card only: the bank screen has no
- *  cancel, so a transfer the buyer walks away from is left to the provider to expire. */
+ *  cancel, so a transfer the buyer walks away from is left to the provider to expire. Once the
+ *  provider has filed a transaction neither this app nor the adapter will call it off, so the
+ *  button would only lead to a refusal. */
 const canCancel = computed(
-  () => paying.value && !requests.meldSubmitted && !requests.fundsSeen && !requests.claiming,
+  () =>
+    paying.value &&
+    !requests.meldSubmitted &&
+    !requests.fundsSeen &&
+    !requests.claiming &&
+    !requests.railSeen,
 );
 
 /** Performs the cancel. One that went through leaves for the selector; a declined one stays put. */
@@ -111,29 +128,6 @@ async function cancelTopUp() {
 
 /** The region the quote is priced in; matches what the picker shows as committed. */
 const selectedCountry = computed(() => session.meldCountry ?? "DE");
-
-/**
- * The regions a bank transfer can actually be made from: Meld has no generic bank code, so a
- * country without a rail is a dead end rather than a slower corridor. Named by the live catalog
- * where it has them, alphabetically, as the design lists them.
- */
-const bankRails = computed(() => {
-  const named = new Map((session.supportedCountries ?? []).map((c) => [c.country, c.name]));
-  return bankRailCountries()
-    .map((country) => ({ country, name: named.get(country) ?? countryName(country) }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-});
-
-/** Fallback region list, used when the adapter's live catalog is unreachable. Remove once
- *  geolocation lands. */
-const FALLBACK_COUNTRIES = [
-  { country: "US", name: "United States" },
-  { country: "CA", name: "Canada" },
-  { country: "GB", name: "United Kingdom" },
-  { country: "DE", name: "Germany" },
-  { country: "AU", name: "Australia" },
-  { country: "BR", name: "Brazil" },
-];
 
 /**
  * What this purchase costs, for the regions priced in the same currency.
@@ -148,33 +142,28 @@ const quotedFloor = computed(() => {
 });
 
 /**
- * The rows the drill-in lists: each rail's own idea of where it can be paid from, both carrying
- * what that region charges and greyed where it cannot take this purchase.
+ * The rows the drill-in lists: every region the catalog names, each carrying what it charges and
+ * greyed where this rail cannot take this purchase from it.
  *
- * The base lists differ — bank has its rails, card has the whole catalog — but what a row says
- * about itself does not, so both go through `corridorOptions`.
+ * Bank offers every Meld BANK_TRANSFER method, but only SEPA and Faster Payments have been paid end
+ * to end; the transfer screen's copy assumes a push transfer. Others (ACH, iDEAL, Interac, PayID…)
+ * are kept for now: disable any that misbehaves.
  */
-const pickerCountries = computed<CountryOption[]>(() => {
-  const live = session.supportedCountries;
-  const base = isBank ? bankRails.value : live && live.length > 0 ? live : FALLBACK_COUNTRIES;
-  return corridorOptions(
-    base,
+const pickerCountries = computed<CountryOption[] | null>(() =>
+  corridorOptions(
+    session.supportedCountries ?? [],
     session.corridorByCountry,
     isBank ? "bank" : "card",
     quotedFloor.value,
-  );
-});
+  ),
+);
 
 // IP-geo first, the device locale otherwise; live, so a late geo answer updates the pin in place.
 const detected = useDetectedCountry();
 
-/** The buyer's detected region, when this route can be paid from it. The card picker judges that
- *  for itself — it pins the region only while it is pickable — so only bank filters here. */
-const detectedCountry = computed(() => {
-  if (detected.value === null) return null;
-  if (!isBank) return detected.value;
-  return bankRailCountries().includes(detected.value) ? detected.value : null;
-});
+/** The buyer's detected region. The picker judges for itself whether this route can be paid from
+ *  it: it pins the region only while it is pickable. */
+const detectedCountry = computed(() => detected.value);
 
 /**
  * Commits a new region. A request already open for the old one is withdrawn first: its pay page
@@ -197,7 +186,8 @@ async function pickCurrency(country: string) {
 /**
  * Demo Skip: play the payment through from the start — the buyer leaving the widget, the provider
  * seeing the transaction, then settling it — so the timeline runs its whole length. The store
- * drives the deposit at the end of that, by faucet or by the mock harness.
+ * sends the deposit by faucet on the press and plays the provider's steps once it is out, or has
+ * the mock harness drop it at the end.
  */
 function onSkip() {
   session.simulateMeldPayment();
@@ -209,8 +199,9 @@ onMounted(async () => {
   session.setAmount(props.selection.amount);
   // The catalog belongs to the route, not to one of its screens: the picker is the route's, and
   // both rails read the same corridors for what a region charges and whether it routes at all.
-  void session.loadSupportedCountries();
-  void session.loadSupportedCorridors();
+  // Usually already read at boot (see the meld-assets plugin); a read that came back empty is
+  // asked again here.
+  void session.loadSupportedCatalog();
   void import("~~/lib/host-chain").then((hostChain) => hostChain.prewarmChains());
   // The bank route starts from the buyer's own region, UNfiltered: a detected region with no
   // transfer rail is still the truth about the buyer, and the pay screen says so ("isn't
@@ -231,106 +222,48 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main
-    class="fixed inset-x-0 mx-auto flex w-full max-w-md flex-col overflow-hidden bg-surface-main"
-    style="
-      top: var(--vvt, 0px);
-      height: var(--vvh, 100dvh);
-      padding-top: env(safe-area-inset-top);
-      padding-bottom: env(safe-area-inset-bottom);
-    "
+  <!-- No title and no screen padding while the card widget is up; the back control stays. -->
+  <ScreenShell
+    :title="paying ? '' : showingCurrency ? 'Choose payment country' : showingFees ? 'Fees' : title"
+    :back="!requests.claiming && !session.resuming && !session.cancelling"
+    :edge="paying"
+    @back="goBack"
   >
-    <!-- No title while the card widget is up; the back control stays. -->
-    <Toolbar
-      :title="
-        paying ? '' : showingCurrency ? 'Choose payment country' : showingFees ? 'Fees' : title
+    <template
+      v-if="
+        (paying || isBank) &&
+        isDemoBuild() &&
+        !requests.claiming &&
+        (session.canSkipDeposit || session.faucetState !== 'idle')
       "
-      :back="!requests.claiming && !session.resuming && !session.cancelling"
-      @back="goBack"
+      #trailing
     >
-      <template
-        v-if="
-          (paying || isBank) &&
-          isDemoBuild() &&
-          !requests.claiming &&
-          (session.canSkipDeposit || session.faucetState !== 'idle')
-        "
-        #trailing
+      <!-- Skip hides once tapped; a spinner takes its place until the deposit is seen. -->
+      <button
+        v-if="session.canSkipDeposit"
+        type="button"
+        class="rounded-medium px-4 py-3 text-label-l font-normal text-fg-primary transition-colors hover:bg-action-tertiary-hover"
+        @click="onSkip"
       >
-        <!-- Skip hides once tapped; a spinner takes its place until the deposit is seen. -->
-        <button
-          v-if="session.canSkipDeposit"
-          type="button"
-          class="rounded-medium px-4 py-3 text-label-l font-normal text-fg-primary transition-colors hover:bg-action-tertiary-hover"
-          @click="onSkip"
-        >
-          Skip
-        </button>
-        <span
-          v-else
-          class="mx-4 my-3 inline-block size-6 animate-spin rounded-full border-[3px] border-stroke-primary border-t-fg-primary"
-        />
-      </template>
-    </Toolbar>
+        Skip
+      </button>
+      <span
+        v-else
+        class="mx-4 my-3 inline-block size-6 animate-spin rounded-full border-[3px] border-stroke-primary border-t-fg-primary"
+      />
+    </template>
 
-    <!-- The screen padding is dropped while the card widget is up. -->
-    <div class="flex min-h-0 flex-1 flex-col" :class="paying ? '' : 'px-6 pt-6'">
-      <div v-if="session.resuming" class="flex flex-col items-center gap-4 pt-16">
-        <span
-          class="inline-block size-8 animate-spin rounded-full border-[3px] border-stroke-primary border-t-fg-primary"
-        />
-        <p class="text-body-m text-fg-secondary">Opening your top-up…</p>
-      </div>
-      <!-- Bank: both steps in one component, with the drill-ins laid over them. It stays mounted
+    <div v-if="session.resuming" class="flex flex-col items-center gap-4 pt-16">
+      <span
+        class="inline-block size-8 animate-spin rounded-full border-[3px] border-stroke-primary border-t-fg-primary"
+      />
+      <p class="text-body-m text-fg-secondary">Opening your top-up…</p>
+    </div>
+    <!-- Bank: both steps in one component, with the drill-ins laid over them. It stays mounted
            behind them — re-creating it would reload the provider's details page. -->
-      <template v-else-if="isBank">
-        <MeldFeeDetailsScreen
-          v-if="showingFees"
-          :quote="quote"
-          :cash-amount="cashAmount"
-          @back="showingFees = false"
-        />
-        <CurrencySelectScreen
-          v-else-if="showingCurrency"
-          :options="pickerCountries"
-          :model-value="selectedCountry"
-          :detected="detectedCountry"
-          :busy="session.cancelling"
-          :notice="session.cancelNotice"
-          @pick="pickCurrency"
-        />
-        <MeldBankTransferScreen
-          v-show="!showingFees && !showingCurrency"
-          :country="selectedCountry"
-          :step="bankStep"
-          @fees="showingFees = true"
-          @currency="showingCurrency = true"
-          @continue="bankStep = 'details'"
-          @leave="emit('back')"
-          @switch-route="emit('switchRoute', $event)"
-        />
-      </template>
-      <template v-else-if="paying">
-        <MeldPaySheet :pay-url="session.meldPayUrl" />
-        <button
-          v-if="canCancel"
-          type="button"
-          class="mx-6 mt-3 mb-4 h-12 shrink-0 rounded-medium bg-status-error text-label-l text-fg-static-white transition-colors hover:bg-status-error-hover disabled:opacity-50"
-          :disabled="session.cancelling || !session.cancelReady"
-          @click="cancelTopUp"
-        >
-          {{ session.cancelling ? "Cancelling…" : "Cancel" }}
-        </button>
-        <p
-          v-if="session.cancelNotice"
-          class="mx-6 mb-4 text-center text-body-m text-fg-secondary"
-          role="status"
-        >
-          {{ session.cancelNotice }}
-        </p>
-      </template>
+    <template v-else-if="isBank">
       <MeldFeeDetailsScreen
-        v-else-if="showingFees"
+        v-if="showingFees"
         :quote="quote"
         :cash-amount="cashAmount"
         @back="showingFees = false"
@@ -338,22 +271,62 @@ onUnmounted(() => {
       <CurrencySelectScreen
         v-else-if="showingCurrency"
         :options="pickerCountries"
+        :loading="session.catalogLoading"
         :model-value="selectedCountry"
         :detected="detectedCountry"
         :busy="session.cancelling"
         :notice="session.cancelNotice"
-        placeholder="Search for a country"
         @pick="pickCurrency"
+        @retry="session.loadSupportedCatalog()"
       />
-      <MeldPayScreen
-        v-else
+      <MeldBankTransferScreen
+        v-show="!showingFees && !showingCurrency"
+        :country="selectedCountry"
+        :step="bankStep"
         @fees="showingFees = true"
         @currency="showingCurrency = true"
+        @continue="bankStep = 'details'"
+        @leave="emit('back')"
         @switch-route="emit('switchRoute', $event)"
+        @change-amount="emit('changeAmount')"
       />
-    </div>
-
-    <!-- state-director scene label (dev/demo keys only) -->
-    <PreviewSceneLabel />
-  </main>
+    </template>
+    <ScreenFrame v-else-if="paying">
+      <MeldPaySheet :pay-url="session.meldPayUrl" />
+      <template v-if="canCancel || session.cancelNotice" #actions>
+        <WidgetCancel
+          :offered="canCancel"
+          :cancelling="session.cancelling"
+          :ready="session.cancelReady"
+          :notice="session.cancelNotice"
+          @cancel="cancelTopUp"
+        />
+      </template>
+    </ScreenFrame>
+    <MeldFeeDetailsScreen
+      v-else-if="showingFees"
+      :quote="quote"
+      :cash-amount="cashAmount"
+      @back="showingFees = false"
+    />
+    <CurrencySelectScreen
+      v-else-if="showingCurrency"
+      :options="pickerCountries"
+      :loading="session.catalogLoading"
+      :model-value="selectedCountry"
+      :detected="detectedCountry"
+      :busy="session.cancelling"
+      :notice="session.cancelNotice"
+      placeholder="Search for a country"
+      @pick="pickCurrency"
+      @retry="session.loadSupportedCatalog()"
+    />
+    <MeldPayScreen
+      v-else
+      @fees="showingFees = true"
+      @currency="showingCurrency = true"
+      @switch-route="emit('switchRoute', $event)"
+      @change-amount="emit('changeAmount')"
+    />
+  </ScreenShell>
 </template>

@@ -5,22 +5,33 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { ChevronRight } from "lucide-vue-next";
 import { useSessionStore } from "../../../stores/session";
-import { methodMinimum, namedCountry, otherMethod } from "~~/lib/supported";
+import { isMethodDown, methodMinimum, namedCountry } from "~~/lib/supported";
 import { detectCountry } from "../../../composables/useDetectedCountry";
 import { fmtFiat, isMoneyAmount } from "../../../utils/money";
+import { fiatAmountRejected, fiatOutOfRange } from "../../../funding/out-of-range";
+import { sessionFailed } from "../../../funding/session-failure";
 import type { FundingRoute } from "../../../funding/selection";
 import DetailRows from "../../ui/DetailRows.vue";
 import PillButton from "../../ui/PillButton.vue";
 import RateErrorScreen from "../../ui/RateErrorScreen.vue";
 import RegionRow from "../../ui/RegionRow.vue";
+import ScreenFrame from "../../ui/ScreenFrame.vue";
 import SkeletonBlock from "../../ui/SkeletonBlock.vue";
 import SkeletonRow from "../../ui/SkeletonRow.vue";
+import AmountOutOfRange from "../AmountOutOfRange.vue";
 import MethodUnavailable from "../MethodUnavailable.vue";
+import { devLog } from "~~/lib/log";
+import { trackAction } from "~~/lib/telemetry";
 
 const session = useSessionStore();
 // switchRoute asks the shell to swap to the crypto package when this region does not route the
 // method; fees opens the fee-breakdown drill-in, currency the region picker.
-const emit = defineEmits<{ switchRoute: [route: FundingRoute]; fees: []; currency: [] }>();
+const emit = defineEmits<{
+  switchRoute: [route: FundingRoute];
+  fees: [];
+  currency: [];
+  changeAmount: [];
+}>();
 
 // The adapter's buyer-facing refusal message, shown under the quote and blocking Continue.
 const startError = ref<string | null>(null);
@@ -53,6 +64,11 @@ function requote() {
   startError.value = null;
   void session.fetchMeldQuote();
 }
+// Out of range: the bound the method takes, in CASH, becomes the amount and is quoted.
+function useAmount(cash: string) {
+  session.setAmount(cash);
+  requote();
+}
 // So does changing region: the refusal the last one earned is not this one's, and it would
 // otherwise keep Continue disabled for a payment that was never refused. The picker lives in the
 // route, so the region is watched rather than handed over.
@@ -64,8 +80,6 @@ watch(
 );
 
 const meldMethod = computed(() => (session.method === "bank" ? "bank" : "card"));
-/** The other fiat method, when this region routes it and not the chosen one. */
-const switchMethod = computed(() => otherMethod(session.meldCorridor, meldMethod.value));
 
 // The charged total is the hero; the toolbar already names the method, so no Via row.
 const heroAmount = computed(() => {
@@ -112,6 +126,7 @@ const canContinue = computed(
     !session.loading &&
     !session.quoteError &&
     !session.meldMethodUnavailable &&
+    !session.quoteAmountRejected &&
     !!session.quoted &&
     !starting.value &&
     // A refusal blocks Continue until a fresh quote clears it.
@@ -119,14 +134,19 @@ const canContinue = computed(
 );
 async function next() {
   if (!canContinue.value) return;
+  trackAction("card.pay");
   starting.value = true;
   startError.value = null;
   try {
     await session.start();
   } catch (e) {
-    console.warn("[meld] could not start the payment:", e);
-    startError.value =
-      e instanceof Error ? e.message : "Could not start the payment. Please try again.";
+    devLog("meld", "could not start the payment", e, "warn");
+    startError.value = sessionFailed(e, {
+      side: "buy",
+      method: meldMethod.value,
+      country: countryLabel.value,
+      provider: session.quoted?.provider,
+    });
     starting.value = false;
   }
 }
@@ -141,10 +161,26 @@ async function next() {
     :country="selectedCountry"
     :country-name="countryLabel"
     :minimum="methodMinimum(session.meldCorridor, meldMethod)"
-    :other="switchMethod"
+    :temporarily="isMethodDown(session.meldCorridor, meldMethod)"
     @region="emit('currency')"
     @use-crypto="emit('switchRoute', 'crypto')"
-    @use-other="switchMethod && emit('switchRoute', switchMethod)"
+  />
+  <AmountOutOfRange
+    v-else-if="session.quoteOutOfRange !== null && !session.loading"
+    :amount="session.amountHuman"
+    :words="fiatOutOfRange(session.quoteOutOfRange, meldMethod, countryLabel)"
+    :region="{ label: 'Payment country', value: countryLabel, country: selectedCountry }"
+    @region="emit('currency')"
+    @change-amount="emit('changeAmount')"
+    @use-amount="useAmount"
+  />
+  <AmountOutOfRange
+    v-else-if="session.quoteAmountRejected && !session.loading"
+    :amount="session.amountHuman"
+    :words="fiatAmountRejected(meldMethod, countryLabel)"
+    :region="{ label: 'Payment country', value: countryLabel, country: selectedCountry }"
+    @region="emit('currency')"
+    @change-amount="emit('changeAmount')"
   />
   <RateErrorScreen
     v-else-if="session.quoteError !== null && !session.loading"
@@ -153,7 +189,7 @@ async function next() {
     @change-country="emit('currency')"
     @use-crypto="emit('switchRoute', 'crypto')"
   />
-  <div v-else class="flex min-h-0 flex-1 flex-col">
+  <ScreenFrame v-else>
     <!-- The hero: the total the card will be charged. The toolbar already names the method. -->
     <div class="flex flex-col items-center text-center">
       <template v-if="heroAmount">
@@ -197,9 +233,11 @@ async function next() {
 
     <p v-if="startError" class="mt-4 text-body-m text-fg-error">{{ startError }}</p>
 
-    <PillButton class="mt-auto w-full" :disabled="!canContinue" @click="next">
-      {{ starting ? "Starting…" : "Continue" }}
-    </PillButton>
-    <PoweredBy class="mt-3 mb-4" provider="Meld" />
-  </div>
+    <template #actions>
+      <PillButton class="w-full" :disabled="!canContinue" @click="next">
+        {{ starting ? "Starting…" : "Continue" }}
+      </PillButton>
+      <PoweredBy provider="Meld" />
+    </template>
+  </ScreenFrame>
 </template>

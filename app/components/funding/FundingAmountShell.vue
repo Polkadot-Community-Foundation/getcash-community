@@ -21,7 +21,12 @@ const props = withDefaults(
     route: FundingRoute | null;
     /** Routes this build can run. Any other renders dimmed, marked "Soon", and unclickable. */
     availableRoutes?: readonly FundingRoute[];
+    /** Routes the backend cannot serve right now; see `AmountScreenProps`. */
+    unservedRoutes?: readonly FundingRoute[];
     history: boolean;
+    /** A top-up or send still running: the clock wears a dot, and Back returns to its screen. */
+    historyBadge?: boolean;
+    back?: boolean;
     error?: string | null;
     loading?: boolean;
     /** Launch-load placeholder: static chrome renders inert, data-driven parts show skeletons. */
@@ -43,6 +48,7 @@ const emit = defineEmits<{
   route: [route: FundingRoute];
   continue: [];
   history: [];
+  back: [];
 }>();
 
 const displayAmount = computed(() => (props.amount === "" ? "0" : groupAmountDigits(props.amount)));
@@ -104,8 +110,12 @@ function requestContinue() {
     <FundingEntryHeader
       :title="title"
       :history="history"
+      :history-badge="historyBadge"
+      :back="back"
+      :centered="back"
       :skeleton="skeleton"
       @history="emit('history')"
+      @back="emit('back')"
     />
 
     <div class="amount-shell-scroll">
@@ -114,6 +124,7 @@ function requestContinue() {
           :routes="config.routes"
           :selected="route"
           :available="availableRoutes"
+          :unserved="unservedRoutes"
           :skeleton="skeleton"
           @select="emit('route', $event)"
         />
@@ -182,6 +193,7 @@ function requestContinue() {
   flex-direction: column;
   align-items: center;
   padding: 1rem;
+  padding-bottom: var(--spacing-cta);
   color: var(--fg-primary);
 }
 
@@ -213,11 +225,5 @@ function requestContinue() {
 .amount-shell-primary {
   width: 100%;
   margin-top: auto;
-}
-
-@media (max-height: 650px) {
-  .amount-shell-content {
-    padding-bottom: 0.75rem;
-  }
 }
 </style>

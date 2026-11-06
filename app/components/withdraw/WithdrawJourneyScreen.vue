@@ -60,12 +60,11 @@ const timeline = computed(() => requests.withdrawalTimelineOf(props.record, now.
 const timelineMessage = computed(
   () => props.notice ?? timeline.value.failure?.text ?? timeline.value.message?.text ?? null,
 );
-const timelineDetail = computed(() => timeline.value.detail ?? null);
 const { success, successShown, successPlaying, drawn, band } = useJourneySuccess({
   succeeded: sent,
   view: () => timeline.value.view,
   message: timelineMessage,
-  detail: timelineDetail,
+  detail: null,
 });
 
 const sentWhen = computed(() =>
@@ -125,7 +124,7 @@ const canCancel = computed(
 <template>
   <!-- The scroller carries -mx-4/px-4 so the timeline card's bleed isn't clipped: overflow-y-auto
        also clips x, and the clip runs at the padding box. -->
-  <div class="-mx-4 flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pb-6">
+  <div class="-mx-4 flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pb-cta">
     <div class="flex flex-col items-center text-center">
       <span
         class="journey-stack size-14 rounded-full"

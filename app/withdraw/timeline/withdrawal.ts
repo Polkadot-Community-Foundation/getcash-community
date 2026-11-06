@@ -10,14 +10,13 @@ import { withdrawalMilestones } from "./facts";
 import { withdrawalTimelineFailure, type WithdrawalTimelineFailure } from "./failure";
 import { withdrawalPhase } from "./phases";
 import { WITHDRAWAL_TIMELINE } from "./spec";
-import { waitingText, withdrawalText } from "./texts";
+import { waitingText, withdrawalMessage } from "./texts";
 
 export interface WithdrawalTimeline {
   /** Absent while the payment is awaited and nothing ended. */
   readonly view?: TimelineView;
   /** Absent once the withdrawal ended, well or badly: the design's done frames carry no band. */
   readonly message?: TimelineMessage;
-  readonly detail?: string;
   /** Present once the withdrawal ended short of success. */
   readonly failure?: WithdrawalTimelineFailure;
 }
@@ -48,10 +47,5 @@ export function withdrawalTimeline(
   if (view === undefined) return { message: normal(waitingText(record)) };
   if (view.state === "failed") return { view, failure: withdrawalTimelineFailure(record) };
   if (view.state === "done") return { view };
-  const text = withdrawalText(record, view.phase, { delayed: view.state === "delayed", now });
-  return {
-    view,
-    message: text.message,
-    ...(text.detail === undefined ? {} : { detail: text.detail }),
-  };
+  return { view, message: withdrawalMessage(record, view.phase, view.state === "delayed") };
 }

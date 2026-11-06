@@ -1,5 +1,11 @@
 export {
   createMeldClient,
+  fiatLimitOf,
+  refusalOf,
+  isAdapterOutage,
+  isAdapterUnreachable,
+  type MeldFiatLimit,
+  type MeldRefusal,
   type MeldClientLike,
   type MeldDepositDisclosure,
   type MeldEndpointConfig,
@@ -34,7 +40,13 @@ export {
   sellQuoteUsable,
   USDT_SELL_TOKEN,
 } from "./sell";
-export { computeMeldQuote, pickBestQuote, type MeldQuoteContext, type MeldQuoteRaw } from "./quote";
+export {
+  computeMeldQuote,
+  MeldAmountOutOfRangeError,
+  pickBestQuote,
+  type MeldQuoteContext,
+  type MeldQuoteRaw,
+} from "./quote";
 export { requestMeldDeposit, type MeldDepositChannel } from "./session";
 export { getMeldStatus } from "./status";
 export {

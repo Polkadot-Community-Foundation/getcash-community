@@ -11,7 +11,8 @@ import type { TimelineRoute } from "./route";
 import { topUpTimeline, type TopUpTimeline } from "./top-up";
 import type { TimelineView } from "./types";
 
-/** How often a shown timeline is evaluated: each second, for time-moved lines and countdowns. */
+/** How often a shown timeline is evaluated: each second, for time-moved lines, time left and the
+ *  reconnect line. */
 export const TIMELINE_CADENCE_MS = 1_000;
 
 /** Evaluations further apart than this mean the app was not running in between. */
@@ -54,7 +55,12 @@ export function createTopUpTimelines(): TopUpTimelineOf {
       sentUnseenMs: 0,
     };
     const route = timelineRouteOf(record);
-    const timeline = topUpTimeline(record, route, { now, watchingSince, previous, sentUnseenMs });
+    const timeline = topUpTimeline(record, route, {
+      now,
+      watchingSince,
+      previous,
+      sentUnseenMs,
+    });
     if (timeline === undefined) {
       shown.set(key, { watchingSince, sentUnseenMs });
       return undefined;

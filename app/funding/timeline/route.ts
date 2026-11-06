@@ -13,9 +13,12 @@ export const delay = (text: string): TimelineMessage => ({ text, delay: true });
 
 export interface TimelineText {
   readonly message: TimelineMessage;
-  /** The detail line under the message, when the phase has one. */
+  /** The detail line under the message: progress the step reports, when it reports any. */
   readonly detail?: string;
 }
+
+export const withDetail = (message: TimelineMessage, detail: string | undefined): TimelineText =>
+  detail === undefined ? { message } : { message, detail };
 
 /** The state a phase's text depends on. `delayed` is whether the current line shows the delay. */
 export interface TextState {
