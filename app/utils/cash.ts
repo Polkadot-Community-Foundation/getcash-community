@@ -21,22 +21,36 @@ export function fmtCash(base: bigint): string {
   return `${s.slice(0, -CASH_DECIMALS)}.${s.slice(-CASH_DECIMALS)}`.replace(/\.?0+$/, "") || "0";
 }
 
-const withSymbol = (human: string, unit: string): string =>
-  `${currencyConfig.symbol}${human} ${unit}`;
+/** A CASH amount as copy writes it ("$50 CASH"), for `<CashText>` to draw as a lockup. */
+export const cashAmount = (human: string): string =>
+  `${currencyConfig.symbol}${human} ${currencyConfig.ticker}`;
 
-/**
- * A CASH amount as a logo, wherever it can only be a string: the symbol on the number, the ticker
- * beside it ("$50 CASH", "+$50 CASH"). Anywhere markup can render, use `<CashAmount>` instead: it
- * carries the same form plus the ticker's small-caps treatment. Inside a sentence, use `cashInText`.
- *
- * The bare token in prose keeps its own form ("Converting to $CASH", "Final $CASH depends on the
- * rate on arrival"), because there it is a name, not a sum.
- */
-export const cashAmount = (human: string): string => withSymbol(human, currencyConfig.ticker);
+/** A run of copy as `<CashText>` draws it: plain text, a `cashAmount()` lockup, or the ticker
+ *  named within a sentence. */
+export type CashTextPart =
+  | { kind: "text"; text: string }
+  | { kind: "lockup"; sign: string; amount: string }
+  | { kind: "word" };
 
-/** A CASH amount inside a sentence, the word in place of the ticker ("Adding $50 Cash to your
- *  balance"). */
-export const cashInText = (human: string): string => withSymbol(human, currencyConfig.word);
+const SYMBOL = currencyConfig.symbol.replace(/[$^.*+?()[\]{}|\\]/g, "\\$&");
+const TICKER = currencyConfig.ticker;
+const CASH_IN_TEXT = new RegExp(
+  `([+-]?)${SYMBOL}(\\d[\\d,]*(?:\\.\\d+)?) ${TICKER}\\b|\\b${TICKER}\\b`,
+  "g",
+);
+
+export function splitCashText(text: string): CashTextPart[] {
+  const parts: CashTextPart[] = [];
+  let end = 0;
+  for (const match of text.matchAll(CASH_IN_TEXT)) {
+    const [whole, sign = "", amount] = match;
+    if (match.index > end) parts.push({ kind: "text", text: text.slice(end, match.index) });
+    parts.push(amount === undefined ? { kind: "word" } : { kind: "lockup", sign, amount });
+    end = match.index + whole.length;
+  }
+  if (end < text.length) parts.push({ kind: "text", text: text.slice(end) });
+  return parts;
+}
 
 /** CASH base units truncated down to the keypad's `decimals` scale. */
 export function cashToRuleUnits(base: bigint, decimals: number): bigint {
