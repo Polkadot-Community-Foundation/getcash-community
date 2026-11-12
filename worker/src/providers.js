@@ -6,16 +6,24 @@
 import { readChannelRecord, readSwapStatus } from "@getsome/chainflip/swap-status";
 import { NETWORK } from "@getsome/core";
 import { depositTokenOf, recordedRoute, stableTxOptions } from "@getsome/funding";
-import { createMeldClient, ensureMeldAssets, MELD_SELL_ENABLED, saleRail } from "@getsome/meld";
+import {
+  createMeldClient,
+  devAdapterFetch,
+  ensureMeldAssets,
+  personhoodAdapterFetch,
+  saleRail,
+} from "@getsome/meld";
 import { LANES, laneSellToken } from "@getsome/offramp";
 import {
   ChannelMismatchError,
   DEFAULT_WITHDRAW_SUBMIT_TIMEOUT_MS,
   DEFAULT_WITHDRAW_TICK_TIMEOUT_MS,
   exactPaymentLanded,
+  finalizedChainOf,
   payExactOnce,
   readAssetHubAccount,
   readDestinationBalance,
+  settleBlock,
   sweepOnce,
 } from "@getsome/withdraw";
 import { paseo_next_v2 } from "@polkadot-api/descriptors";
@@ -28,6 +36,7 @@ import {
   keypairFor,
   signOptionsFor,
 } from "./shared.js";
+import { getHostLocalStorage, proveLitePersonhood } from "./host.js";
 
 /** Room for the host calls a payment makes without a bound of their own: the key's derivation
  *  and the save before the broadcast. */
@@ -60,19 +69,13 @@ export function railFor(provider, record) {
     return { status: (id) => readSwapStatus(id), channel: (id) => readChannelRecord(id) };
   }
   if (provider === "meld") {
-    // Where the build does not sell for fiat, no sale is read or paid, whatever a hand-off says.
-    if (!MELD_SELL_ENABLED) return null;
     const meld = record?.meld;
     if (meld?.offline === true) {
       return NETWORK.testnet ? { status: async () => ({ status: "receiving" }) } : null;
     }
     if (typeof meld?.baseUrl !== "string" || meld.baseUrl === "") return null;
-    const client = createMeldClient({
-      baseUrl: meld.baseUrl,
-      ...(typeof meld.productId === "string" && meld.productId
-        ? { productId: meld.productId }
-        : {}),
-    });
+    const fetchImpl = adapterFetchFor(meld);
+    const client = createMeldClient({ baseUrl: meld.baseUrl, ...(fetchImpl ? { fetchImpl } : {}) });
     // A direct sale is paid in the token the hand-off's sale lands on the key.
     const rail = record?.swap
       ? swapSaleRail(saleRail(client, record, Date.now, LANE_TOKENS), record)
@@ -80,6 +83,31 @@ export function railFor(provider, record) {
     return withMeldAssets(rail, client);
   }
   return null;
+}
+
+const personhoodFetches = new Map();
+
+/** Proves the worker to the adapter as the page that handed the sale off did. A personhood fetch
+ *  is kept per adapter and product, and shares the page's stored token. */
+function adapterFetchFor({ baseUrl, productId, auth }) {
+  if (typeof productId !== "string" || !productId) return undefined;
+  if (auth !== "personhood") return devAdapterFetch(productId);
+  const key = `${baseUrl} ${productId}`;
+  if (!personhoodFetches.has(key)) {
+    personhoodFetches.set(
+      key,
+      personhoodAdapterFetch({
+        baseUrl,
+        productId,
+        storage: {
+          readJSON: async (k) => (await getHostLocalStorage()).readJSON(k),
+          writeJSON: async (k, value) => (await getHostLocalStorage()).writeJSON(k, value),
+        },
+        prove: (message) => proveLitePersonhood(productId, message),
+      }),
+    );
+  }
+  return personhoodFetches.get(key);
 }
 
 /**
@@ -206,6 +234,7 @@ export async function exactPaymentOut(record, amount, exact) {
     const assetHubApi = client.getTypedApi(paseo_next_v2);
     return await exactPaymentLanded(
       {
+        assetHubApi,
         amount,
         tickTimeoutMs: DEFAULT_WITHDRAW_TICK_TIMEOUT_MS,
         readKey: () => readAssetHubAccount(assetHubApi, record.keyPublicKeyHex, token),
@@ -213,6 +242,42 @@ export async function exactPaymentOut(record, amount, exact) {
       },
       exact,
     );
+  } finally {
+    client.destroy();
+  }
+}
+
+/**
+ * What became of the key's payment to the channel, seen in a best block: "final" once Asset Hub's
+ * finalized chain holds that block, or shows the payment's effect in another; "pending" while it
+ * is not past that block, or while the payment shows only at the best head; "gone" when it shows
+ * nowhere, and the key pays again. A block that was replaced, or one too old for the chain to
+ * name, says nothing of the payment itself, which usually landed in the block that took its
+ * place: `shows(key)` reads its effect on the key, its balance in the sale's token and its nonce.
+ * With `unknownStands`, a block too old to name stands without that read: a sweep empties the key
+ * and a swap's refund can fill it again, so the key could not tell a sweep never left.
+ */
+export async function paymentOutcome(record, seen, shows, { unknownStands = false } = {}) {
+  const client = await connectChain(record.assetHubGenesis, "asset hub");
+  try {
+    const assetHubApi = client.getTypedApi(paseo_next_v2);
+    const verdict = await settleBlock(
+      finalizedChainOf(assetHubApi),
+      seen,
+      DEFAULT_WITHDRAW_TICK_TIMEOUT_MS,
+    );
+    if (verdict === "pending" || verdict === "final") return verdict;
+    if (verdict === "unknown" && unknownStands) return "final";
+    const token = depositTokenOf(recordedRoute(record));
+    const read = (at) =>
+      bounded(
+        readAssetHubAccount(assetHubApi, record.keyPublicKeyHex, token, { at }),
+        DEFAULT_WITHDRAW_TICK_TIMEOUT_MS,
+        `key read on asset hub (${at})`,
+      );
+    if (shows(await read("finalized"))) return "final";
+    if (shows(await read("best"))) return "pending";
+    return "gone";
   } finally {
     client.destroy();
   }

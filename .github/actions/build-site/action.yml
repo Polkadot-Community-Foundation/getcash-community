@@ -27,8 +27,8 @@ inputs:
     default: ""
   meld-product-id:
     description: >
-      VITE_MELD_PRODUCT_ID, the product id sent as the adapter's `x-dev-product-id`
-      header and vetted against its `allowed_products`. Inlined at build time. An
+      VITE_MELD_PRODUCT_ID, this product's id, vetted against the adapter's
+      `allowed_products`. Inlined at build time. An
       empty value fails the build for the same reason meld-base-url does (see
       require-secrets): the code falls back to `getcash.dev`, which an adapter
       that does not list it refuses with 401 on every call — a quote that cannot be
@@ -43,13 +43,13 @@ inputs:
     default: ""
   top-up-minimum:
     description: >
-      Optional VITE_TOP_UP_MINIMUM, the least a top up can be, in CASH. Empty uses the build's
-      default, 1 CASH.
+      Optional VITE_TOP_UP_MINIMUM, the least a top up or a withdrawal can be, in CASH. Empty uses
+      the build's default, 1 CASH.
     default: ""
   top-up-maximum:
     description: >
-      Optional VITE_TOP_UP_MAXIMUM, the most a top up can be, in CASH. Empty uses the build's
-      default, 5000 CASH.
+      Optional VITE_TOP_UP_MAXIMUM, the most a top up or a withdrawal can be, in CASH. Empty uses
+      the build's default, 5000 CASH.
     default: ""
   sentry-dsn:
     description: >
