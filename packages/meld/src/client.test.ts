@@ -365,6 +365,21 @@ describe("createMeldClient error mapping", () => {
     await expect(client.createSession(SESSION_REQ)).rejects.toThrow(/no pay page/);
   });
 
+  it.each(["javascript:alert(1)", "data:text/html,x", "http://pay.test", "pay.test", 7])(
+    "treats the widget URL %j as no pay page",
+    async (url) => {
+      const { impl } = stubFetch(201, {
+        fundingRequestId: "funding-9",
+        sessionId: "s9",
+        serviceProviderWidgetUrl: url,
+        widgetUrl: url,
+      });
+      const client = createMeldClient({ baseUrl: "https://adapter.test", fetchImpl: impl });
+
+      await expect(client.createSession(SESSION_REQ)).rejects.toThrow(/no pay page/);
+    },
+  );
+
   it("accepts a session that has only Meld's own widget URL", async () => {
     // One of the two URLs is enough.
     const { impl } = stubFetch(201, {
@@ -703,7 +718,7 @@ describe("createMeldClient: a 429's retry-after", () => {
 });
 
 describe("the asset table", () => {
-  it("reads GET /assets with the dev product header, keeping the rows the app knows", async () => {
+  it("reads GET /assets, keeping the rows the app knows", async () => {
     const { impl, calls } = stubSequence([
       {
         status: 200,
@@ -715,14 +730,9 @@ describe("the asset table", () => {
         },
       },
     ]);
-    const client = createMeldClient({
-      baseUrl: "https://adapter.test/",
-      productId: "app.dot",
-      fetchImpl: impl,
-    });
+    const client = createMeldClient({ baseUrl: "https://adapter.test/", fetchImpl: impl });
     expect(await client.getAssets()).toEqual([{ asset: "dot@assethub", code: "DOT" }]);
     expect(calls[0]?.url).toBe("https://adapter.test/assets");
-    expect(new Headers(calls[0]?.init?.headers).get("x-dev-product-id")).toBe("app.dot");
     // Bounded, so an adapter that hangs cannot hold every caller sharing the read.
     expect(calls[0]?.init?.signal).toBeInstanceOf(AbortSignal);
   });

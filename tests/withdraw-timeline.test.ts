@@ -11,7 +11,7 @@ import {
 import { LINE_LIMIT } from "../app/funding/timeline/model";
 import { delay, normal } from "../app/funding/timeline/route";
 import { requestRefOf } from "../app/utils/request-index";
-import { withdrawalJourneyRows } from "../app/withdraw/timeline/journey-rows";
+import { receivedText, withdrawalJourneyRows } from "../app/withdraw/timeline/journey-rows";
 import { withdrawalListProgress } from "../app/withdraw/timeline/list";
 import { withdrawalPhase } from "../app/withdraw/timeline/phases";
 import { WITHDRAWAL_TIMELINE } from "../app/withdraw/timeline/spec";
@@ -458,7 +458,7 @@ describe("withdrawal timeline", () => {
     );
     expect(handing.view?.state).toBe("delayed");
     expect(handing.message).toEqual({
-      text: "Your Cash is ready and waiting for the network to confirm it",
+      text: "Your CASH is ready and waiting for the network to confirm it",
       delay: true,
     });
   });
@@ -536,7 +536,7 @@ describe("withdrawal timeline", () => {
       "crypto",
       chainflip,
       [
-        "Converting your Cash",
+        "Converting your CASH",
         "Moving your money to the exchange",
         "Handing your money to the exchange",
         "Exchanging your money for USDC",
@@ -548,7 +548,7 @@ describe("withdrawal timeline", () => {
       "card",
       sale,
       [
-        "Converting your Cash",
+        "Converting your CASH",
         "Moving your money to the payment provider",
         "Handing your money to the payment provider",
         "The provider is preparing your payout",
@@ -560,7 +560,7 @@ describe("withdrawal timeline", () => {
       "bank",
       (o: Partial<WithdrawalRecord>) => sale({ route: "bank", ...o }),
       [
-        "Converting your Cash",
+        "Converting your CASH",
         "Moving your money to the payment provider",
         "Handing your money to the payment provider",
         "The provider is preparing your payout",
@@ -891,6 +891,48 @@ describe("withdrawal list progress", () => {
   });
 });
 
+describe("what a withdrawal delivered", () => {
+  const sent = { kind: "sent", at: at(6) } as const;
+  /** A direct withdrawal done, the worker's report of what its sale landed in hand or not. */
+  const direct = (received?: string, overrides: Partial<WithdrawalRecord> = {}) =>
+    record({
+      status: sent,
+      witnesses: {
+        worker: {
+          known: true,
+          phase: "done",
+          done: true,
+          fundsSeenAt: at(1),
+          lastTickAt: at(6),
+          at: at(6),
+          ...(received === undefined ? {} : { received }),
+        },
+      },
+      ...overrides,
+    });
+
+  it("is the exact figure the worker sent, in the destination's asset, for a direct withdrawal", () => {
+    // DOT through the pool, ten decimals.
+    expect(receivedText(direct("43151334329"))).toBe("4.3151 DOT");
+    // USDT out of the PSM, six decimals: 10 CASH left the balance, 9.749856 arrived.
+    const usdt = direct("9749856", {
+      destination: { ...record().destination, asset: "USDT" },
+      handoff: { ...record().handoff, tier: "psm", external: "USDT", feeRate: 5_000 },
+    });
+    expect(receivedText(usdt)).toBe("9.7498 USDT");
+  });
+
+  it("is the quote's figure, approximate, where a provider pays out its own", () => {
+    expect(receivedText(chainflip({ status: sent }))).toBe("≈ 24.44 USDC");
+    expect(receivedText(sale({ status: sent }))).toBe("≈ €24.20");
+  });
+
+  it("is unknown before the worker reported it, and the screen keeps what left the balance", () => {
+    expect(receivedText(direct())).toBeNull();
+    expect(receivedText(record({ status: sent }))).toBeNull();
+  });
+});
+
 describe("withdrawal journey rows", () => {
   it("shows what lands and where for a crypto withdrawal, with fees while the route has them", () => {
     const rows = withdrawalJourneyRows(chainflip({ status: { kind: "sending", at: at(3) } }), {
@@ -943,7 +985,7 @@ describe("withdrawal journey rows", () => {
     expect(bank[1]).toEqual({
       label: "Arrives",
       value: "1–2 business days",
-      note: "Final Cash depends on the rate on arrival",
+      note: "Final CASH depends on the rate on arrival",
     });
     expect(
       withdrawalJourneyRows(failed(sale(), "egress-failed", "send"), { feesAvailable: false }),
@@ -1029,7 +1071,7 @@ describe("withdrawal timeline, band", () => {
     });
     expect(withdrawalTimeline(converting, { now: at(3) })).toEqual({
       view: expect.anything(),
-      message: normal("Converting your Cash"),
+      message: normal("Converting your CASH"),
     });
     const handing = chainflip({
       status: { kind: "sending", at: at(3) },
