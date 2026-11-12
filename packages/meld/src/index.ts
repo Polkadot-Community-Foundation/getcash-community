@@ -1,6 +1,7 @@
 export {
   createMeldClient,
   fiatLimitOf,
+  httpsUrl,
   refusalOf,
   isAdapterOutage,
   isAdapterUnreachable,
@@ -19,6 +20,13 @@ export {
   type MeldStatusResult,
   type MeldCancelResult,
 } from "./client";
+export {
+  type CredentialStorage,
+  devAdapterFetch,
+  isPersonhoodUnavailable,
+  personhoodAdapterFetch,
+  type PersonhoodFetchConfig,
+} from "./auth";
 export { formatBaseUnits, parseBaseUnits, toBaseUnits, type MeldToken } from "./units";
 export { ensureMeldAssets } from "./assets";
 export {
@@ -28,7 +36,6 @@ export {
   formatSellAmount,
   isDirectSellCode,
   isDirectUsdt,
-  MELD_SELL_ENABLED,
   SALE_GONE_AFTER,
   SALE_GONE_FOR_MS,
   type SaleChannelRecord,

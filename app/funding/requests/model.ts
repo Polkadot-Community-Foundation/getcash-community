@@ -612,7 +612,7 @@ export interface WithdrawalHandoffPayload {
   channel?: WithdrawalChannel;
   /** A fiat sale only: the adapter the worker reads the sale from, or `offline` for a build that
    *  ran the stand-in sale and has no adapter. */
-  meld?: { baseUrl?: string; productId?: string; offline?: boolean };
+  meld?: { baseUrl?: string; productId?: string; auth?: "dev" | "personhood"; offline?: boolean };
   /** A fiat sale through an offramp lane only: the Chainflip channel the key pays, swapping its
    *  USDT for the lane's asset and paying it to the provider's deposit address (`channel`). Opened
    *  by the page once that address is known. */
@@ -718,6 +718,9 @@ export interface WithdrawJobView {
   /** Where a PSM-tier job's CASH leaves the key on Asset Hub: the PSM, or the pool once the user
    *  chose it from a hold. */
   exit?: "psm" | "pool";
+  /** What the destination received, base units of the landing asset, read when the arrival was
+   *  seen: what a direct withdrawal's user got. Null until then. */
+  received?: string | null;
   txs?: {
     call: "swap" | "withdraw" | "redeem" | "pool-exit" | "sweep" | "pay";
     txHash: string;
@@ -806,6 +809,9 @@ export interface WithdrawalRecord {
           lastError?: string;
           at: number;
           txs?: WithdrawJobView["txs"];
+          /** What the destination received, as the worker reported it
+           *  (`WithdrawJobView.received`). */
+          received?: string;
         }
       | { known: false; at: number };
     host?: { status: HostPaymentStatus; at: number };

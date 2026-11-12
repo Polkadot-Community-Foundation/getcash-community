@@ -3,6 +3,7 @@
 // `createFakeMeldClient` is the offline stand-in.
 
 import { parseMeldAssets, type MeldAsset } from "@getsome/core";
+import { isPersonhoodUnavailable } from "./auth";
 
 /** Forward-quote request. Meld quotes are source-denominated: the buyer names the fiat they pay
  *  and Meld returns the crypto delivered. `computeMeldQuote` iterates this for a reverse target. */
@@ -203,13 +204,11 @@ export interface MeldClientLike extends Partial<MeldSellClientLike> {
 export interface MeldEndpointConfig {
   /** Base URL of the onramp adapter service, e.g. '/api/meld'. */
   baseUrl: string;
-  /** Sent as `x-dev-product-id` for the adapter's dev auth. */
-  productId?: string;
   /** Idempotency key per session create. Defaults to a key derived from the purchase intent. */
   idempotencyKey?: () => string;
   /** Where the embedded widget lands the buyer on completion; forwarded to Meld's redirectUrl. */
   redirectUrl?: string;
-  /** Injectable fetch (tests / non-browser). Defaults to global fetch. */
+  /** Proves the caller: `devAdapterFetch` or `personhoodAdapterFetch`. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
 }
 
@@ -424,6 +423,16 @@ function toQuoteEntries(raw: Record<string, unknown>[]): MeldQuoteEntry[] {
     }));
 }
 
+/** `value` when it is an `https:` URL, the only kind a widget frame may load. */
+export function httpsUrl(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    return new URL(value).protocol === "https:" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The deposit terms on a funding record, all required parts or nothing. Half a disclosure is
  * worse than none: an empty address is somewhere to send real funds, and a made-up `observedAt`
@@ -457,6 +466,7 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
     try {
       return await fetchImpl(url, init);
     } catch (cause) {
+      if (isPersonhoodUnavailable(cause)) throw cause;
       throw new AdapterUnreachable(cause);
     }
   };
@@ -490,10 +500,7 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
     ].join("-");
   const nextKey = config.idempotencyKey;
 
-  const headers = (): Record<string, string> => ({
-    accept: "application/json",
-    ...(config.productId ? { "x-dev-product-id": config.productId } : {}),
-  });
+  const headers = (): Record<string, string> => ({ accept: "application/json" });
 
   /**
    * Parses the adapter's JSON body. On a non-OK response, maps `{ error: { tag, value } }` to an
@@ -552,14 +559,14 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
     const data = await read(res, "the payment status");
     const funding = (data.funding as Record<string, unknown> | undefined) ?? {};
     const deposit = depositOf(funding.deposit);
+    const serviceProviderWidgetUrl = httpsUrl(funding.serviceProviderWidgetUrl);
+    const widgetUrl = httpsUrl(funding.widgetUrl);
     return {
       status: String(funding.status ?? ""),
       ...(funding.providerStatus != null ? { providerStatus: String(funding.providerStatus) } : {}),
       // Present only while the purchase is still payable.
-      ...(funding.serviceProviderWidgetUrl != null
-        ? { serviceProviderWidgetUrl: String(funding.serviceProviderWidgetUrl) }
-        : {}),
-      ...(funding.widgetUrl != null ? { widgetUrl: String(funding.widgetUrl) } : {}),
+      ...(serviceProviderWidgetUrl !== undefined ? { serviceProviderWidgetUrl } : {}),
+      ...(widgetUrl !== undefined ? { widgetUrl } : {}),
       ...(typeof funding.expiresAt === "number" ? { expiresAt: funding.expiresAt } : {}),
       // The terms the row was opened with. Reported for concluded rows too.
       ...(funding.walletAddress != null ? { walletAddress: String(funding.walletAddress) } : {}),
@@ -642,8 +649,8 @@ export function createMeldClient(config: MeldEndpointConfig): MeldClientLike & M
             "[meld] the adapter returned no fundingRequestId; status could not be polled",
           );
         }
-        const widgetUrl = String(data.serviceProviderWidgetUrl ?? "");
-        const meldWidgetUrl = data.widgetUrl != null ? String(data.widgetUrl) : undefined;
+        const widgetUrl = httpsUrl(data.serviceProviderWidgetUrl) ?? "";
+        const meldWidgetUrl = httpsUrl(data.widgetUrl);
         if (!widgetUrl && !meldWidgetUrl) throw new Error(walk.noSurfaceMessage(fundingRequestId));
         return {
           fundingRequestId,
