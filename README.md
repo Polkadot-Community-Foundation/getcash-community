@@ -247,13 +247,13 @@ the native symbol and, for Asset Hub and People, the para id, genesis hash and e
 CASH asset id on Asset Hub and People's pool account. `.papi/` holds the metadata the calls are
 typed from and must name the same genesis hashes; the build refuses a mismatch. Both describe Paseo
 Next. Demo builds, and with them the faucet and Skip, need `"testnet": true`; the build refuses
-`VITE_FAUCET_SEED` otherwise.
+`VITE_FAUCET_CONTRACT` otherwise.
 
 Copy `.env.example` to `.env` and fill in what you need. Nuxt reads `.env`, not `.env.local`.
 
 | Variable                        | Purpose                                                                                                                                                                                                                         |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `VITE_FAUCET_SEED`              | demo faucet account, holding PAS, dotUSD, USDt and USDC on Asset Hub; inlined into the client bundle, use a testnet account                                                                                                     |
+| `VITE_FAUCET_CONTRACT`          | demo faucet contract on Asset Hub that pays Skip's deposit in PAS, dotUSD, USDt or USDC against a lite personhood proof, signed by getcash's product account with the fee in PGAS                                               |
 | `VITE_DEPLOYER_SEED`            | fallback for `MNEMONIC` in `deploy.sh`                                                                                                                                                                                          |
 | `VITE_MELD_BASE_URL`            | origin of the Meld adapter; unset, the offline fake Meld client runs instead. Meld's currency codes are read from its `GET /assets` at runtime, never written in this app                                                       |
 | `VITE_MELD_PRODUCT_ID`          | this product's id, which the adapter's `allowed_products` must list; in `personhood` mode, the id the Host gives getcash (its domain)                                                                                           |
