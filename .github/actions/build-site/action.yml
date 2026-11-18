@@ -8,10 +8,10 @@ inputs:
   artifact-name:
     description: Name to upload the built site under; the deploy workflow downloads it by this name.
     default: site
-  faucet-seed:
+  faucet-contract:
     description: >
-      Optional VITE_FAUCET_SEED, inlined into the bundle at build time. Empty is
-      valid; the build then has no demo faucet.
+      Optional VITE_FAUCET_CONTRACT, the address of the faucet contract that pays
+      Skip. Empty is valid; the build then has no demo faucet.
     default: ""
   chainflip-broker-api-key:
     description: >
@@ -112,7 +112,7 @@ runs:
     - name: Build static site
       shell: bash
       env:
-        VITE_FAUCET_SEED: ${{ inputs.faucet-seed }}
+        VITE_FAUCET_CONTRACT: ${{ inputs.faucet-contract }}
         VITE_CHAINFLIP_BROKER_API_KEY: ${{ inputs.chainflip-broker-api-key }}
         VITE_MELD_BASE_URL: ${{ inputs.meld-base-url }}
         VITE_MELD_PRODUCT_ID: ${{ inputs.meld-product-id }}

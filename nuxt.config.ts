@@ -8,10 +8,10 @@ import { DEFAULT_THEME, THEMES } from "./app/theme/theme";
 import papiConfig from "./.papi/polkadot-api.json";
 import { NETWORK } from "./packages/core/src/network";
 
-// The faucet seed is inlined into the bundle, so a network with real funds must never get one.
-if (!NETWORK.testnet && process.env.VITE_FAUCET_SEED?.trim()) {
+// A faucet makes the build a demo build, so a network with real funds must never get one.
+if (!NETWORK.testnet && process.env.VITE_FAUCET_CONTRACT?.trim()) {
   throw new Error(
-    "VITE_FAUCET_SEED is set, but packages/core/src/network.json does not mark the network as a testnet",
+    "VITE_FAUCET_CONTRACT is set, but packages/core/src/network.json does not mark the network as a testnet",
   );
 }
 

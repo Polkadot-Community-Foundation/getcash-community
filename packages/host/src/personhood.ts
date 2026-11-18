@@ -8,7 +8,7 @@ const PEOPLE_LITE = toHex(
 );
 
 /** The adapter verifies proofs in the product's context at index 0 only. */
-const CONTEXT_INDEX = 0;
+const ADAPTER_CONTEXT_INDEX = 0;
 
 export interface RingLocationLike {
   chainId: string;
@@ -27,12 +27,22 @@ export interface RingVrfAccountsLike<Handle> {
     context: { productId: string; suffix: { tag: "Index"; value: number } },
     ring: RingLocationLike,
     message: Uint8Array,
-  ): PromiseLike<ResultLike<{ proof: Uint8Array; ringIndex: number }>>;
+  ): PromiseLike<
+    ResultLike<{
+      proof: Uint8Array;
+      ringIndex: number;
+      ringRevision: number;
+      contextualAlias: { alias: Uint8Array };
+    }>
+  >;
 }
 
 export interface PersonhoodProof {
   proof: Uint8Array;
   ringIndex: number;
+  ringRevision: number;
+  /** The person's alias in the proof's context. */
+  alias: Uint8Array;
 }
 
 /** The Host refused, e.g. `NotMember` for a user in no lite ring yet. */
@@ -54,26 +64,28 @@ function unwrap<T>(result: ResultLike<T>): T {
   );
 }
 
-/** Proves `message` as a lite person in `productId`'s context, whose TLD names the key owner. */
+/** Proves `message` as a lite person in `productId`'s context at `contextIndex`, whose TLD names
+ *  the key owner. */
 export async function proveLitePersonhood<Handle>(
   accounts: RingVrfAccountsLike<Handle>,
   productId: string,
   message: Uint8Array,
+  contextIndex: number = ADAPTER_CONTEXT_INDEX,
 ): Promise<PersonhoodProof> {
   const owner = `peopl.${productId.slice(productId.lastIndexOf(".") + 1)}`;
   const keys = unwrap(await accounts.listRingVrfKeys(owner));
   for (const { handle, rings } of keys) {
     const ring = rings.find(isPeopleLite);
     if (ring === undefined) continue;
-    const { proof, ringIndex } = unwrap(
+    const { proof, ringIndex, ringRevision, contextualAlias } = unwrap(
       await accounts.createRingVRFProof(
         handle,
-        { productId, suffix: { tag: "Index", value: CONTEXT_INDEX } },
+        { productId, suffix: { tag: "Index", value: contextIndex } },
         ring,
         message,
       ),
     );
-    return { proof, ringIndex };
+    return { proof, ringIndex, ringRevision, alias: contextualAlias.alias };
   }
   throw new PersonhoodRefused(`no ${owner} key in people-lite`);
 }

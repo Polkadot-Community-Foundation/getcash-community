@@ -35,7 +35,12 @@ function accounts(overrides: Partial<RingVrfAccountsLike<string>> = {}) {
     },
     createRingVRFProof: (...args) => {
       calls.push(["prove", ...args]);
-      return ok({ proof: new Uint8Array([1, 2]), ringIndex: 62 });
+      return ok({
+        proof: new Uint8Array([1, 2]),
+        ringIndex: 62,
+        ringRevision: 7,
+        contextualAlias: { alias: new Uint8Array([9]) },
+      });
     },
     ...overrides,
   };
@@ -49,7 +54,12 @@ describe("proveLitePersonhood", () => {
 
     const proof = await proveLitePersonhood(fake, "getcash.dot", message);
 
-    expect(proof).toEqual({ proof: new Uint8Array([1, 2]), ringIndex: 62 });
+    expect(proof).toEqual({
+      proof: new Uint8Array([1, 2]),
+      ringIndex: 62,
+      ringRevision: 7,
+      alias: new Uint8Array([9]),
+    });
     expect(calls).toEqual([
       ["list", "peopl.dot"],
       [
@@ -60,6 +70,17 @@ describe("proveLitePersonhood", () => {
         message,
       ],
     ]);
+  });
+
+  it("proves at the context index it is given", async () => {
+    const { fake, calls } = accounts();
+
+    await proveLitePersonhood(fake, "getcash.dot", new Uint8Array(56), 20_775);
+
+    expect(calls[1]?.[2]).toEqual({
+      productId: "getcash.dot",
+      suffix: { tag: "Index", value: 20_775 },
+    });
   });
 
   it("carries the Host's refusal", async () => {

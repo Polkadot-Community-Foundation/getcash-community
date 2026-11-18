@@ -26,7 +26,7 @@ jobs:
 
       - uses: ./.github/actions/build-site
         with:
-          faucet-seed: ${{ secrets.VITE_FAUCET_SEED }}
+          faucet-contract: ${{ vars.VITE_FAUCET_CONTRACT }}
           chainflip-broker-api-key: ${{ secrets.VITE_CHAINFLIP_BROKER_API_KEY }}
           meld-base-url: ${{ secrets.VITE_MELD_BASE_URL }}
           meld-product-id: ${{ secrets.VITE_MELD_PRODUCT_ID }}
