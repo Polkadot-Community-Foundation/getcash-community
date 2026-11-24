@@ -34,6 +34,13 @@ inputs:
       that does not list it refuses with 401 on every call — a quote that cannot be
       fetched, and a country catalog that silently empties to its fallback list.
     default: ""
+  adapter-auth:
+    description: >
+      VITE_ADAPTER_AUTH, the adapter's auth mode: `dev` sends meld-product-id as
+      `x-dev-product-id`, which an adapter in `insecure_dev` mode takes on trust;
+      `personhood` proves the user with the Host's lite personhood key, and then
+      meld-product-id must be the id the Host gives getcash (its domain).
+    default: "dev"
   offramp-lanes:
     description: >
       Optional VITE_OFFRAMP_LANES, the off-ramp lanes card and bank sales go through, best first,
@@ -116,12 +123,20 @@ runs:
         VITE_CHAINFLIP_BROKER_API_KEY: ${{ inputs.chainflip-broker-api-key }}
         VITE_MELD_BASE_URL: ${{ inputs.meld-base-url }}
         VITE_MELD_PRODUCT_ID: ${{ inputs.meld-product-id }}
+        VITE_ADAPTER_AUTH: ${{ inputs.adapter-auth }}
         VITE_OFFRAMP_LANES: ${{ inputs.offramp-lanes }}
         VITE_TOP_UP_MINIMUM: ${{ inputs.top-up-minimum }}
         VITE_TOP_UP_MAXIMUM: ${{ inputs.top-up-maximum }}
         VITE_SENTRY_DSN: ${{ inputs.sentry-dsn }}
         REQUIRE_SECRETS: ${{ inputs.require-secrets }}
       run: |
+        case "$VITE_ADAPTER_AUTH" in
+          dev | personhood) ;;
+          *)
+            echo "::error::adapter-auth must be dev or personhood, not \"$VITE_ADAPTER_AUTH\"."
+            exit 1
+            ;;
+        esac
         if [ -z "$VITE_MELD_BASE_URL" ]; then
           if [ "$REQUIRE_SECRETS" = "true" ]; then
             echo "::error::VITE_MELD_BASE_URL is empty. Set the repo secret VITE_MELD_BASE_URL to the Meld adapter origin; a deployable build must not fall back to the offline fake Meld client."
