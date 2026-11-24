@@ -29,7 +29,9 @@ jobs:
           faucet-seed: ${{ secrets.VITE_FAUCET_SEED }}
           chainflip-broker-api-key: ${{ secrets.VITE_CHAINFLIP_BROKER_API_KEY }}
           meld-base-url: ${{ secrets.VITE_MELD_BASE_URL }}
-          meld-product-id: ${{ secrets.VITE_MELD_PRODUCT_ID }}
+          # The Host's id for getcash is its domain, the name the deploy job publishes.
+          meld-product-id: getcash.dot
+          adapter-auth: personhood
 
   deploy:
     needs: build
