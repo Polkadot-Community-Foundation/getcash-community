@@ -7,7 +7,8 @@
 //
 // EVERYTHING THE KEY HOLDS LEAVES. The XCM is sized from the key's whole CASH balance after the
 // swap, read to the unit, and the PAS left for the transaction fee's headroom is reaped with the
-// account. The redeem takes everything but its fee's margin and the CASH account's minimum.
+// account, or stays with the existential deposit on a key the chain will not close. The redeem
+// takes everything but its fee's margin and the CASH account's minimum.
 //
 // EVERY READ IS AT THE BEST HEAD, and a submit is settled as soon as a best block holds it, as the
 // top up does: each step acts on what the step before did, and waiting for finality between them
@@ -285,9 +286,9 @@ export interface WithdrawTickInput {
   assetHubAnchor: () => Promise<{ hash: string; number: number }>;
   /** The finalized head's number on Asset Hub. */
   readFinalizedNumber: () => Promise<number>;
-  /** The key's CASH and PAS on People, at the best head or the finalized one. Every step reads
-   *  the best head; the finalized one only settles an XCM whose block the chain can no longer
-   *  vouch for. */
+  /** The key's CASH on People and the PAS it can send (`readKeyOnPeople`), at the best head or
+   *  the finalized one. Every step reads the best head; the finalized one only settles an XCM
+   *  whose block the chain can no longer vouch for. */
   readKeyOnPeople: (
     ss58: string,
     at: "best" | "finalized",
@@ -439,11 +440,7 @@ export async function withdrawTickOnce(
   // the run waits for it to come back.
   const answerLost =
     state.xcmCashSent === null
-      ? balances.cash === 0n &&
-        balances.pas === 0n &&
-        state.fundsSeenAt !== null &&
-        state.attempts > 0 &&
-        state.xcmSigned
+      ? balances.cash === 0n && state.fundsSeenAt !== null && state.attempts > 0 && state.xcmSigned
       : balances.cash < state.xcmCashSent;
   if (answerLost) {
     // The XCM is in the latest block or an earlier one, with no hash known: the key at the

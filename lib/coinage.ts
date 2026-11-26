@@ -672,10 +672,16 @@ function depositBudget(
  *  quoted instead, which is what the worker's gate waits for. */
 export function handoffFees(
   sizing: FundingSizing,
-): Pick<WorkerHandoffPayload, "remoteFeeBuffer" | "keepNativeForFees" | "quotedDeposit"> {
+): Pick<
+  WorkerHandoffPayload,
+  "remoteFeeBuffer" | "keepNativeForFees" | "keepAliveNative" | "quotedDeposit"
+> {
   return {
     remoteFeeBuffer: sizing.remoteFeeBuffer.toString(),
     keepNativeForFees: ("keepNativeForFees" in sizing ? sizing.keepNativeForFees : 0n).toString(),
+    ...("keepAliveNative" in sizing && sizing.keepAliveNative !== undefined
+      ? { keepAliveNative: sizing.keepAliveNative.toString() }
+      : {}),
     ...("quotedDeposit" in sizing ? { quotedDeposit: sizing.quotedDeposit.toString() } : {}),
   };
 }
@@ -1242,10 +1248,12 @@ export async function createCoinageSession(
     });
     const keepNativeForFees = pool?.keepNativeForFees ?? DEFAULT_KEEP_NATIVE_FOR_FEES;
     const remoteFeeBuffer = pool?.remoteFeeBuffer ?? DEFAULT_REMOTE_FEE_BUFFER;
-    sizing = { tier: "pool", remoteFeeBuffer, keepNativeForFees };
+    const keepAliveNative = pool?.keepAliveNative;
+    sizing = { tier: "pool", remoteFeeBuffer, keepNativeForFees, keepAliveNative };
     // Size the native budget the user must deposit from the live pool quote for the CASH
     // settle amount, plus the headroom that lets the deposit clear the worker's swap gate after
-    // the pool moves, plus the retained fee native.
+    // the pool moves, plus the retained fee native, plus what a burner the chain keeps open needs
+    // where the estimate measured it.
     budget = await stage(
       "pool budget sizing",
       15_000,
@@ -1255,6 +1263,7 @@ export async function createCoinageSession(
         settleAmount: args.amount,
         remoteFeeBuffer,
         keepNativeForFees,
+        keepAliveNative,
         slippagePct,
       }),
     );
