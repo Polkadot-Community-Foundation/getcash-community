@@ -12,7 +12,7 @@ import { base58, bech32, createBase58check } from "@scure/base";
 
 /** Exported so a consumer that must cover every refund chain — an explorer map, say — can be
  *  checked against the set rather than restating it. */
-export const REFUND_CHAINS = ["Bitcoin", "Ethereum", "Arbitrum", "Tron", "Solana"] as const;
+export const REFUND_CHAINS = ["Bitcoin", "Ethereum", "Arbitrum", "Bsc", "Tron", "Solana"] as const;
 
 export type RefundChain = (typeof REFUND_CHAINS)[number];
 
@@ -45,6 +45,7 @@ export function deriveRefundKey(
       return bitcoin(secp256k1Secret(seed), opts.bitcoinNetwork ?? "mainnet");
     case "Ethereum":
     case "Arbitrum":
+    case "Bsc":
       return {
         chain,
         address: checksumAddress(evmAddressBytes(secp256k1Secret(seed))),
@@ -96,7 +97,7 @@ function evmAddressBytes(secret: Uint8Array): Uint8Array {
 }
 
 /** EIP-55 mixed-case checksum. */
-function checksumAddress(bytes: Uint8Array): string {
+export function checksumAddress(bytes: Uint8Array): string {
   const lower = bytesToHex(bytes);
   const hash = bytesToHex(keccak_256(utf8ToBytes(lower)));
   let out = "0x";

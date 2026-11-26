@@ -30,6 +30,7 @@ import {
   PSM_EXTERNAL,
   recordedRoute,
   type ConversionRoute,
+  type DepositValue,
   type FundingStep,
 } from "@getsome/funding";
 import { depositWindowFor } from "../funding/config";
@@ -88,12 +89,7 @@ import {
 } from "~~/lib/coinage";
 import type { HostedCoinageWorld } from "~~/lib/coinage-live";
 import { isHosted } from "~~/lib/host-account";
-import type {
-  DepositValue,
-  FundingSizing,
-  PoolFundingSizing,
-  PsmFundingSizing,
-} from "~~/lib/funding-fees";
+import type { FundingSizing, PoolFundingSizing, PsmFundingSizing } from "~~/lib/funding-fees";
 import { isDemoBuild } from "../utils/demo";
 import { isMeldSourceId } from "../funding/source-ids";
 import { fmtCash, toCashBase } from "../utils/cash";
@@ -936,6 +932,7 @@ export const useSessionStore = defineStore("session", () => {
           settleAmount,
           remoteFeeBuffer: sizing.remoteFeeBuffer,
           keepNativeForFees: sizing.keepNativeForFees,
+          keepAliveNative: sizing.keepAliveNative,
         }),
       );
     } catch (e) {
@@ -1452,6 +1449,7 @@ export const useSessionStore = defineStore("session", () => {
                   settleAmount: settleForPricing,
                   remoteFeeBuffer: priced.remoteFeeBuffer,
                   keepNativeForFees: priced.keepNativeForFees,
+                  keepAliveNative: priced.keepAliveNative,
                   // A direct deposit carries its own headroom, as the hosted sizing does.
                   ...(direct === null ? {} : { slippagePct: DIRECT_SLIPPAGE_PCT }),
                 }))(),
@@ -2205,22 +2203,25 @@ export const useSessionStore = defineStore("session", () => {
       const route = await routeForMismatch(record);
       let value: DepositValue | null = null;
       if (route !== null) {
-        const [{ quoteDepositValue }, { connectChain, ASSET_HUB, PEOPLE }, funding] =
-          await Promise.all([
-            import("~~/lib/funding-fees"),
-            import("~~/lib/host-chain"),
-            import("@getsome/funding"),
-          ]);
-        value = await quoteDepositValue({
-          ahClient: await connectChain(ASSET_HUB),
-          peopleClient: await connectChain(PEOPLE),
-          underlyingAssetId: funding.PASEO_UNDERLYING_ASSET_ID,
-          peopleParaId: funding.PASEO_PEOPLE_PARA_ID,
-          probeAddress: record.deposit!.address,
-          route,
-          deposit: BigInt(record.depositMismatch!.amount),
-          slippagePct: funding.DIRECT_SLIPPAGE_PCT,
-        });
+        const [{ connectChain, ASSET_HUB, PEOPLE }, funding] = await Promise.all([
+          import("~~/lib/host-chain"),
+          import("@getsome/funding"),
+        ]);
+        try {
+          value = await funding.quoteDepositValue({
+            ahClient: await connectChain(ASSET_HUB),
+            peopleClient: await connectChain(PEOPLE),
+            underlyingAssetId: funding.PASEO_UNDERLYING_ASSET_ID,
+            peopleParaId: funding.PASEO_PEOPLE_PARA_ID,
+            probeAddress: record.deposit!.address,
+            route,
+            deposit: BigInt(record.depositMismatch!.amount),
+            slippagePct: funding.DIRECT_SLIPPAGE_PCT,
+          });
+        } catch (e) {
+          // A deposit the pool cannot price is an answer, as one below its fees is.
+          if (!(e instanceof funding.DepositUnpricedError)) throw e;
+        }
       }
       if (foregroundMismatch.value?.key === key) {
         mismatchPrice.value = { key, at: Date.now(), route, value };
@@ -2255,7 +2256,14 @@ export const useSessionStore = defineStore("session", () => {
     route: ConversionRoute,
     value: DepositValue,
   ): WorkerHandoffPayload {
-    const { external: _e, feeRate: _f, quotedDeposit: _q, tier: _t, ...rest } = handoff;
+    const {
+      external: _e,
+      feeRate: _f,
+      quotedDeposit: _q,
+      tier: _t,
+      keepAliveNative: _k,
+      ...rest
+    } = handoff;
     return {
       ...rest,
       settleAmount: value.receive.toString(),

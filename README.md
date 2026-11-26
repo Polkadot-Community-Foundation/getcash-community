@@ -21,11 +21,18 @@ app plus a background worker, both published to bulletin/DotNS.
 The **surface** (`app/`, `lib/`) is what the user sees. It quotes, shows a deposit address or
 opens the provider's widget, and tracks the request. The **worker** (`worker/`) runs in the
 background inside the host. Once a deposit has landed, the surface hands the job to the
-worker, which converts it to CASH and sends it to the People chain in one transaction on Asset
-Hub (by teleport, or by reserve transfer where the chains do not trust the teleport), then, as
-soon as that CASH shows at People's best block, claims it through the host's top-up call, while it
-keeps watching the conversion's block until Asset Hub finalizes it. The top-up is registered
-under the ephemeral account's public key and driven by the host from there.
+worker. The worker takes the deposit at Asset Hub's best block, whoever sent it: a fork that
+drops the deposit drops the conversion built on it too, and a dropped transfer usually lands
+again. While it is gone the worker waits for it again and the surface shows it arriving again,
+warning after an hour; a deposit gone for a day is given up as lost. A deposit the buyer sent
+from their own wallet has no provider to send it again: ten minutes after it left, once the
+dropped transfer can no longer land, the surface shows the deposit screen again and asks the
+buyer to resend it. The worker converts the deposit to CASH and sends it to the People chain in
+one transaction on Asset Hub (by teleport, or by reserve transfer where the chains do not trust
+the teleport), then, as soon as that CASH shows at People's best block, claims it through the
+host's top-up call, while it keeps watching the conversion's block until Asset Hub finalizes it.
+The top-up is registered under the ephemeral account's public key and driven by the host from
+there.
 The surface shows the top-up done as soon as the host reports the claim in a block; the worker
 follows the host's status over a subscription it holds open until the claim is final, and
 registers a further top-up for whatever a short claim left on the account. The worker keeps going
@@ -254,7 +261,7 @@ Copy `.env.example` to `.env` and fill in what you need. Nuxt reads `.env`, not 
 | Variable                        | Purpose                                                                                                                                                                                                                         |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `VITE_FAUCET_SEED`              | demo faucet account, holding PAS, dotUSD, USDt and USDC on Asset Hub; inlined into the client bundle, use a testnet account                                                                                                     |
-| `VITE_DEPLOYER_SEED`            | fallback for `MNEMONIC` in `deploy.sh`                                                                                                                                                                                          |
+| `DEPLOYER_SEED`                 | fallback for `MNEMONIC` in `deploy.sh`                                                                                                                                                                                          |
 | `VITE_MELD_BASE_URL`            | origin of the Meld adapter; unset, the offline fake Meld client runs instead. Meld's currency codes are read from its `GET /assets` at runtime, never written in this app                                                       |
 | `VITE_MELD_PRODUCT_ID`          | this product's id, which the adapter's `allowed_products` must list; in `personhood` mode, the id the Host gives getcash (its domain)                                                                                           |
 | `VITE_ADAPTER_AUTH`             | the adapter's auth mode: `dev` (default) sends the product id as `x-dev-product-id`; `personhood` proves the user with the Host's lite personhood key and sends the adapter's token                                             |
@@ -292,7 +299,7 @@ deployment would do. Each is marked `TODO(production)` at its definition:
 ```
 
 Builds the worker and the site and publishes both with `bulletin-deploy`, which must be
-installed globally. The deploying account comes from `MNEMONIC`, or from `VITE_DEPLOYER_SEED`
+installed globally. The deploying account comes from `MNEMONIC`, or from `DEPLOYER_SEED`
 in `.env.local` or `.env`.
 
 CI does the same: a push to `main` deploys `getcash.paseo`, and every pull request gets a

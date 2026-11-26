@@ -41,9 +41,12 @@
 //
 // THE SUBMIT WAITS FOR INCLUSION; THE ARRIVAL IS READ AT PEOPLE'S BEST BLOCK. The submit
 // resolves once the program is in a best block with its outcome, so a conversion holds the tick
-// for one inclusion at most. The deposit is read at Asset Hub's finalized block. The run is done,
-// and the claim registered, as soon as People's best block holds the target. A shortfall ends
-// the run, so it is confirmed at People's finalized block. A submit whose answer was lost is
+// for one inclusion at most. The deposit is read at Asset Hub's best block, whoever sent it. A
+// conversion built on it sits in a later block of the same chain, so a fork that takes the
+// deposit takes the conversion too, and the deposit is read again before anything goes out; a
+// transfer a fork drops lands again, from the transaction pool or the sender's own retry. The run
+// is done, and the claim registered, as soon as People's best block holds the target. A shortfall
+// ends the run, so it is confirmed at People's finalized block. A submit whose answer was lost is
 // settled from the chain: the nonce unmoved means nothing landed and the same nonce may go out
 // again. A best block can be replaced, so the block the program landed in is kept, with its
 // hash, through done, until the chain is final past it: the finalized chain holding another
@@ -88,7 +91,12 @@
 // (trap.ts). FundingTrappedError then ends the run as a recovery, never as a timeout, and nothing
 // is converted twice: the trap waits for the burner's claim.
 
-import { TOKENS } from "@getsome/core";
+import {
+  assetHubAssetLocation,
+  sendableNative,
+  TOKENS,
+  type SendableNativeOptions,
+} from "@getsome/core";
 import { paseo_next_v2 } from "@polkadot-api/descriptors";
 import type {
   HexString,
@@ -133,7 +141,7 @@ import {
   type ConversionRoute,
   type StablePoolRoute,
 } from "./route";
-import { stableTxOptions } from "./stable";
+import { asLocation, stableTxOptions } from "./stable";
 import { findTrap, trapScanSpan } from "./trap";
 
 type AssetHubApi = TypedApi<typeof paseo_next_v2>;
@@ -231,6 +239,11 @@ export class FundingTrappedError extends Error {
 /** Paid rejections in a row with the same answer before the run is held. */
 export const MAX_PROGRAM_REJECTIONS = 3;
 
+/** How long after the program's block was found replaced an empty burner, with nothing on
+ *  People, is taken as the deposit gone with it. A program the chain put back into a later block
+ *  shows its CASH on People well within this. */
+export const DEPOSIT_GONE_AFTER_MS = 60_000;
+
 /** Terminal: the chain would not take the conversion. The run stops and the deposit stays on the
  *  burner, recoverable through its secret; it is not sent through the pool instead.
  *
@@ -256,8 +269,8 @@ export class FundingHeldError extends Error {
 }
 
 export interface FundingBalances {
-  /** The deposit on Asset Hub in the asset the route expects: the native on the pool tier, the
-   *  external on the PSM tier, the stable on the stable pool tier. */
+  /** The deposit on Asset Hub in the asset the route expects: the native the burner can send on
+   *  the pool tier, the external on the PSM tier, the stable on the stable pool tier. */
   depositAh: bigint;
   underlyingPeople: bigint;
 }
@@ -279,43 +292,28 @@ export function decideStep(b: FundingBalances, t: FundingTargets): FundingStep {
   return "await-native";
 }
 
-type Junction = { type?: string; value?: unknown };
-
-const junctionsOf = (loc: AssetLocation): Junction[] => {
-  const interior = (loc as { interior?: { type?: string; value?: unknown } }).interior;
-  if (interior?.value === undefined) return [];
-  return Array.isArray(interior.value) ? interior.value : [interior.value as Junction];
-};
-
-/** Structural junction match (number/bigint/string-agnostic, order-independent). */
-const isUnderlying = (loc: AssetLocation, assetId: number): boolean =>
-  junctionsOf(loc).some(
-    (j) => j?.type === "GeneralIndex" && BigInt(j.value as never) === BigInt(assetId),
-  );
-
-/** The chain's native asset as AssetConversion keys it: an interior-Here location. */
-const isNative = (loc: AssetLocation): boolean =>
-  ((loc as { parents?: number }).parents ?? 0) <= 1 &&
-  (loc as { interior?: { type?: string } }).interior?.type === "Here";
-
-/** Finds the native pool of each underlying in one read of the pool table, in the order asked,
- *  and returns both sides' exact Location keys. */
+/** The native pool of each pallet-assets asset, in the order asked, named by its exact key: the
+ *  native's Location, then the asset's. Anyone can add a pool to the table, so it is never
+ *  searched; one read of those keys confirms the pools exist. */
 export async function discoverPools(
   api: AssetHubApi,
   underlyingAssetIds: readonly number[],
 ): Promise<Pool[]> {
-  const pools = await api.query.AssetConversion.Pools.getEntries();
-  return underlyingAssetIds.map((underlyingAssetId) => {
-    for (const entry of pools) {
-      const [a, b] = entry.keyArgs[0] ?? [];
-      if (a === undefined || b === undefined) continue;
-      if (isUnderlying(a, underlyingAssetId) && isNative(b)) return { native: b, underlying: a };
-      if (isUnderlying(b, underlyingAssetId) && isNative(a)) return { native: a, underlying: b };
-    }
+  const native = asLocation(TOKENS.PAS.location);
+  const pools = underlyingAssetIds.map((assetId): Pool => ({
+    native,
+    underlying: asLocation(assetHubAssetLocation(assetId)),
+  }));
+  const found = await api.query.AssetConversion.Pools.getValues(
+    pools.map((pool) => [[pool.native, pool.underlying]]),
+  );
+  const missing = found.indexOf(undefined);
+  if (missing !== -1) {
     throw new Error(
-      `no native AssetConversion pool found for underlying asset ${underlyingAssetId}`,
+      `no native AssetConversion pool found for underlying asset ${underlyingAssetIds[missing]}`,
     );
-  });
+  }
+  return pools;
 }
 
 /** `discoverPools` for one underlying. */
@@ -328,8 +326,8 @@ export function withHeadroom(amount: bigint, slippagePct: number): bigint {
   return (amount * BigInt(Math.round((100 + slippagePct) * 100))) / 10_000n;
 }
 
-/** Fresh exact-IN quote: the underlying `nativeIn` buys right now. The funding program gives the
- *  burner's whole native balance above its fees; this asks whether the pool can take that much.
+/** Fresh exact-IN quote: the underlying `nativeIn` buys right now. The funding program gives all
+ *  the native the burner can send above its fees; this asks whether the pool can take that much.
  *
  *  `null` when the pool cannot price this much (too shallow for the amount): that is an
  *  answer about the pool, not a transport failure, so it is returned rather than thrown and
@@ -379,10 +377,19 @@ export async function quoteNativeInMax(
   return withHeadroom(await quoteNativeIn(api, pool, underlyingOut), slippagePct);
 }
 
+/** Native the ask carries on top of the headroom for a burner the chain keeps open: the
+ *  existential deposit that stays on it, and the dispatch fee of the one attempt the chain may
+ *  refuse before the pipeline holds that deposit back. The gate counts neither, so they stay out
+ *  of keepNativeForFees. */
+export async function keepAliveNative(api: AssetHubApi, dispatchNative: bigint): Promise<bigint> {
+  return (await api.constants.Balances.ExistentialDeposit()) + dispatchNative;
+}
+
 /** The native budget the rail must deliver for `settleAmount` to be claimable on the pool tier:
  *  the pool quote for settle+buffer plus the headroom (DEFAULT_SLIPPAGE_PCT), plus the native
- *  the funding program spends on its own fees. The single source of truth for app-side budget
- *  sizing; uses the same defaults as the pipeline.
+ *  the funding program spends on its own fees, plus `keepAliveNative` where the caller measured
+ *  it. The single source of truth for app-side budget sizing; uses the same defaults as the
+ *  pipeline.
  *
  *  No credit is netted off. Each request has its own burner, so there is nothing on it to
  *  net against, and a quote that shrinks itself against a balance the buyer cannot see is
@@ -394,6 +401,7 @@ export async function sizeNativeBudget(input: {
   remoteFeeBuffer?: bigint;
   slippagePct?: number;
   keepNativeForFees?: bigint;
+  keepAliveNative?: bigint;
 }): Promise<bigint> {
   const keep = input.keepNativeForFees ?? DEFAULT_KEEP_NATIVE_FOR_FEES;
   const buyTarget = input.settleAmount + (input.remoteFeeBuffer ?? DEFAULT_REMOTE_FEE_BUFFER);
@@ -405,7 +413,7 @@ export async function sizeNativeBudget(input: {
     buyTarget,
     input.slippagePct ?? DEFAULT_SLIPPAGE_PCT,
   );
-  return nativeInMax + keep;
+  return nativeInMax + keep + (input.keepAliveNative ?? 0n);
 }
 
 /** Fresh exact-out quote on the stable/native pool: the stable that buys `nativeOut` right now.
@@ -488,6 +496,20 @@ export interface TickState {
   peopleAtXcm: bigint;
   /** When the first tick saw funds (ms); null while the deposit is still awaited. */
   fundsSeenAt: number | null;
+  /** When the deposit left the best chain after it was seen (ms): a fork took its block, with
+   *  the conversion's when one went out. The run waits for it again; null once it is back, and
+   *  while it never left. */
+  depositLeftAt: number | null;
+  /** When the program's block was first found replaced, while the burner has stayed empty and
+   *  nothing has shown on People since (ms). Past DEPOSIT_GONE_AFTER_MS the deposit is taken as
+   *  gone with it. Null otherwise. */
+  replacedAt: number | null;
+  /** When the latest read that found the burner's deposit account empty at the best block
+   *  started (ms): the worker's own word that no deposit was there then. Null before any. */
+  emptyReadAt: number | null;
+  /** When the latest read that found money on that account, of any amount, started (ms). The
+   *  later of this and `emptyReadAt` is what the latest read found. Null before any. */
+  heldReadAt: number | null;
   /** The burner's nonce at the latest block before the last submit, kept until the chain's final
    *  word on it: with `xcmSubmitted` unset the answer is owed and a tick settles from the chain
    *  what became of the submit; set, the conversion's block going final lets it go. */
@@ -495,8 +517,8 @@ export interface TickState {
   /** The block the program was seen in and its hash, kept until the chain is final past it: the
    *  finalized chain holding that hash at that height makes the conversion final, another hash
    *  means the block was replaced. A lost answer settled as landed names the latest block with
-   *  no hash; once the chain is final past it, the burner's finalized nonce and deposit say
-   *  whether the program ran. Null once settled. */
+   *  no hash; once the chain is final past it, the burner's finalized nonce, or else People's
+   *  finalized block, says whether the program ran. Null once settled. */
   inclusionBlock: number | null;
   inclusionHash: string | null;
   /** The target was seen on People in a best block. The run stays done on it while the
@@ -522,6 +544,10 @@ export const freshTickState = (): TickState => ({
   xcmSubmitted: false,
   peopleAtXcm: 0n,
   fundsSeenAt: null,
+  depositLeftAt: null,
+  replacedAt: null,
+  emptyReadAt: null,
+  heldReadAt: null,
   nonceAtSubmit: null,
   inclusionBlock: null,
   inclusionHash: null,
@@ -609,18 +635,22 @@ export interface TickOutcome {
 type BlockTag = "best" | "finalized";
 
 /** The burner's deposit on Asset Hub in the asset the route expects, at a block tag or a block
- *  hash: the native's free balance, or the holding of the pallet-assets id the route's token
- *  names. */
+ *  hash: the native the account can send (`sendableNative`), or the holding of the pallet-assets
+ *  id the route's token names. */
 export async function readDeposit(
   api: AssetHubApi,
   route: ConversionRoute,
   address: string,
   at: BlockTag | HexString,
+  options?: SendableNativeOptions,
 ): Promise<bigint> {
   const token = depositTokenOf(route);
   if (token.assetHubId === undefined) {
-    const account = await api.query.System.Account.getValue(address, { at });
-    return account?.data.free ?? 0n;
+    const [account, existentialDeposit] = await Promise.all([
+      api.query.System.Account.getValue(address, { at }),
+      api.constants.Balances.ExistentialDeposit(),
+    ]);
+    return sendableNative(account, existentialDeposit, options);
   }
   const held = await api.query.Assets.Account.getValue(token.assetHubId, address, { at });
   return held?.balance ?? 0n;
@@ -691,6 +721,12 @@ export function includedInBlock(watch: Watch, timeoutMs: number, what: string): 
     // The watch may have settled before the subscription could be held.
     if (settled) subscription.unsubscribe();
   });
+}
+
+/** The deposit is gone from the best chain: the run waits for it as before it came. */
+function markDepositLeft(state: TickState, now: number): void {
+  state.fundsSeenAt = null;
+  state.depositLeftAt = now;
 }
 
 /** The program is in a block. The latch holds until finality settles it, and the rejection
@@ -814,7 +850,7 @@ function rejected(
 }
 
 /** The last submit's answer was lost, to a worker killed mid-send or to the inclusion bound. The
- *  chain says whether it landed: People up, or the burner reaped, or the nonce moved with the
+ *  chain says whether it landed: People up, or the burner emptied, or the nonce moved with the
  *  deposit short of what the program needs, and it did. The nonce alone cannot tell, since a
  *  program that reaped the burner starts its nonce over; the deposit alone cannot either, since
  *  a dearer program leaves an intact deposit short. Nothing landed and the nonce unmoved, the
@@ -853,11 +889,18 @@ async function settleLostSubmit(
 }
 
 /** A lost answer settled as landed knows no block hash, only that the program is in the latest
- *  block or an earlier one. Once the finalized chain is past that block, the burner there shows
- *  whether it ran: its nonce moved, or its deposit gone with the reaped account. Neither, and the
+ *  block or an earlier one. Once the finalized chain is past that block, it shows whether the
+ *  program ran: the burner's nonce moved there. A burner the program reaped starts its nonce
+ *  over, and its empty account says nothing, since the deposit was taken at the best block and a
+ *  fork can take it with the program; so People says it, from its finalized block. Otherwise the
  *  block was replaced: the latch is released, and a later tick finds the program again in a best
- *  block or sends it again. Read after the block number, so they see at least that block. */
-async function convertedAtFinalized(input: TickOnceInput, nonceAtSubmit: number): Promise<boolean> {
+ *  block, or sends it again once the deposit is back. Read after the block number, so they see at
+ *  least that block. */
+async function convertedAtFinalized(
+  input: TickOnceInput,
+  nonceAtSubmit: number,
+  ranOnPeople: () => Promise<boolean>,
+): Promise<boolean> {
   const { api, route, address } = input;
   const [nonce, deposit] = await bounded(
     Promise.all([
@@ -867,7 +910,9 @@ async function convertedAtFinalized(input: TickOnceInput, nonceAtSubmit: number)
     input.tickTimeoutMs,
     "nonce and deposit reads (finalized)",
   );
-  return nonce > nonceAtSubmit || deposit === 0n;
+  if (nonce > nonceAtSubmit) return true;
+  if (deposit !== 0n) return false;
+  return ranOnPeople();
 }
 
 /** The program is in a best block the chain may yet replace, so the finalized chain has the last
@@ -882,6 +927,7 @@ async function settleInclusion(
   nonceAtSubmit: number,
   inclusionBlock: number,
   inclusionHash: string | null,
+  ranOnPeople: () => Promise<boolean>,
 ): Promise<void> {
   const { api } = input;
   const finalizedBlock = await bounded(
@@ -894,7 +940,7 @@ async function settleInclusion(
   if (finalizedBlock <= inclusionBlock) return;
   const final =
     inclusionHash === null
-      ? await convertedAtFinalized(input, nonceAtSubmit)
+      ? await convertedAtFinalized(input, nonceAtSubmit, ranOnPeople)
       : (await bounded(
           api.query.System.BlockHash.getValue(inclusionBlock, { at: "finalized" }),
           input.tickTimeoutMs,
@@ -902,10 +948,12 @@ async function settleInclusion(
         )) === inclusionHash;
   if (final) {
     state.nonceAtSubmit = null;
+    state.replacedAt = null;
   } else {
     // People drops the arrival with the block.
     state.xcmSubmitted = false;
     state.arrived = false;
+    state.replacedAt ??= input.now();
   }
   state.inclusionBlock = null;
   state.inclusionHash = null;
@@ -920,15 +968,49 @@ async function settleInclusion(
 export async function tickOnce(input: TickOnceInput, state: TickState): Promise<TickOutcome> {
   const { api, route, address } = input;
   const buyAmount = input.settleAmount + input.remoteFeeBuffer;
+  const readStartedAt = input.now();
   const [depositAh, peopleHeld] = await bounded(
     Promise.all([
-      readDeposit(api, route, address, "finalized"),
+      // What keeps an account open can land after this read and be gone by the next, so a refused
+      // withdrawal holds the existential deposit back whatever the account shows.
+      readDeposit(api, route, address, "best", {
+        keepAlive: state.lastRejection === WITHDRAWAL_REFUSED,
+      }),
       input.readUnderlyingOnPeople(address, "best"),
     ]),
     input.tickTimeoutMs,
     "tick balance reads",
   );
+  if (depositAh === 0n) state.emptyReadAt = readStartedAt;
+  else state.heldReadAt = readStartedAt;
 
+  const readTrap = (sent: bigint) =>
+    bounded(
+      findTrap(
+        input.peopleApi,
+        input.beneficiaryHex,
+        sent,
+        trapScanSpan(state.peopleFeeCash),
+        // What the program's dry run had to land before it was submitted.
+        input.settleAmount - state.peopleAtXcm,
+      ),
+      input.tickTimeoutMs,
+      "trap read",
+    );
+  // The program ran on People: People's finalized block holds the CASH it sent, or a trap holds
+  // it there. Asked only of a burner found empty, since a fork can take the deposit, the program
+  // and the arrival People saw at its best block all together. A claim the host made final since
+  // leaves nothing there, and ends the run on its own.
+  const ranOnPeople = async (): Promise<boolean> => {
+    const held = await bounded(
+      input.readUnderlyingOnPeople(address, "finalized"),
+      input.tickTimeoutMs,
+      "People read (finalized)",
+    );
+    if (held > state.peopleAtXcm) return true;
+    if (state.sentToPeople === null) return false;
+    return (await readTrap(state.sentToPeople)) !== null;
+  };
   if (state.xcmSubmitted && state.nonceAtSubmit !== null && state.inclusionBlock !== null) {
     await settleInclusion(
       input,
@@ -936,7 +1018,28 @@ export async function tickOnce(input: TickOnceInput, state: TickState): Promise<
       state.nonceAtSubmit,
       state.inclusionBlock,
       state.inclusionHash,
+      ranOnPeople,
     );
+  }
+  // The program's block was replaced. An empty burner then means either that the chain put the
+  // program back into a later block, which empties the burner too, or that the fork took the
+  // deposit with it. Only People tells them apart, so the run waits for its CASH there: a burner
+  // still empty with nothing on People a while later is a deposit gone and a program that never
+  // ran. Its submit is settled as such, and the run waits for the deposit as before it came.
+  // A claim registered with the host is left to the host: it may take the CASH off People as it
+  // lands, so an empty People proves nothing there.
+  if (state.replacedAt !== null) {
+    if (depositAh > 0n || peopleHeld > state.peopleAtXcm || input.claimRegistered) {
+      state.replacedAt = null;
+    } else if (input.now() - state.replacedAt >= DEPOSIT_GONE_AFTER_MS && !(await ranOnPeople())) {
+      state.xcmSubmitted = false;
+      state.arrived = false;
+      state.nonceAtSubmit = null;
+      state.inclusionBlock = null;
+      state.inclusionHash = null;
+      state.replacedAt = null;
+      markDepositLeft(state, input.now());
+    }
   }
 
   const balances: FundingBalances = { depositAh, underlyingPeople: peopleHeld };
@@ -952,16 +1055,7 @@ export async function tickOnce(input: TickOnceInput, state: TickState): Promise<
     state.sentToPeople !== null &&
     peopleHeld <= state.peopleAtXcm
   ) {
-    const trap = await bounded(
-      findTrap(
-        input.peopleApi,
-        input.beneficiaryHex,
-        state.sentToPeople,
-        trapScanSpan(state.peopleFeeCash),
-      ),
-      input.tickTimeoutMs,
-      "trap read",
-    );
+    const trap = await readTrap(state.sentToPeople);
     if (trap !== null) throw new FundingTrappedError(trap.amount, trap.key, input.beneficiaryHex);
   }
 
@@ -1119,8 +1213,25 @@ export async function tickOnce(input: TickOnceInput, state: TickState): Promise<
   } else if (state.arrived && state.xcmSubmitted) {
     effective = "done";
   }
-  // Funds seen: from here the conversion is on the clock.
-  if (state.fundsSeenAt === null && effective !== "await-native") state.fundsSeenAt = input.now();
+  // The deposit left the best chain before any program went out for it: a fork took the block it
+  // was seen in. Only an empty burner says so; a paid rejection leaves the deposit short, not gone.
+  if (
+    state.fundsSeenAt !== null &&
+    effective === "await-native" &&
+    depositAh === 0n &&
+    !state.xcmSubmitted &&
+    state.nonceAtSubmit === null
+  ) {
+    markDepositLeft(state, input.now());
+  }
+  // Any money on the account again, short of the gate or not, ends the wait for the deposit that
+  // left: the run waits on its deposit window as for any deposit.
+  if (depositAh > 0n) state.depositLeftAt = null;
+  // Funds seen: from here the conversion is on the clock, and a deposit that left is back.
+  if (effective !== "await-native") {
+    state.fundsSeenAt ??= input.now();
+    state.depositLeftAt = null;
+  }
 
   // The pre-send record stays until the conversion is final: a later tick settles it, and sends
   // again if the chain discards the block.
@@ -1158,8 +1269,8 @@ export async function tickOnce(input: TickOnceInput, state: TickState): Promise<
 
   if (effective === "swap") {
     const pool = poolOf(input);
-    // Withdraw the whole native balance minus the dispatch fee, pay the XCM's fees in native,
-    // exchange the rest inside the holding, and send the result to the burner on People.
+    // Withdraw all the native the burner can send minus the dispatch fee, pay the XCM's fees in
+    // native, exchange the rest inside the holding, and send the result to the burner on People.
     const fees = await bounded(
       estimateFundingProgramFees({
         api,
@@ -1294,6 +1405,9 @@ export function exchangeFloor(target: bigint, quoted: bigint, floorPct: number):
  *  exchange, and the stable tier's second. */
 const POOL_EXCHANGE_MISSED = "ExchangeAsset failed with NoDeal";
 const STABLE_EXCHANGE_MISSED = "ExchangeAsset #2 failed with NoDeal";
+/** How a rejection reads when the chain would not let the pool tier's program withdraw what it
+ *  named. The program withdraws once, so the instruction carries no number. */
+const WITHDRAWAL_REFUSED = "WithdrawAsset failed with FailedToTransactAsset";
 
 interface ExchangeFloor {
   amount: bigint;

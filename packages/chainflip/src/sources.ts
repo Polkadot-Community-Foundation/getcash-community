@@ -1,8 +1,10 @@
-// The frozen Chainflip source catalog: 13 sources, ids locked in core's SourceId. Availability
+// The frozen Chainflip source catalog: 15 sources, ids locked in core's SourceId. Availability
 // is gated at runtime per source by probeLiquidity.
 
 import { sha256 } from "@noble/hashes/sha2.js";
-import type { SourceDescriptor, SourceId, TokenSpec } from "@getsome/core";
+import { hexToBytes } from "@noble/hashes/utils.js";
+import type { EvmChain, SourceDescriptor, SourceId, TokenSpec } from "@getsome/core";
+import { checksumAddress } from "@getsome/ephemeral";
 
 function validateBtcRefundAddress(addr: string): boolean {
   const trimmed = addr.trim();
@@ -11,9 +13,15 @@ function validateBtcRefundAddress(addr: string): boolean {
   );
 }
 
-// Shape-only: 0x + 40 hex. The checksum is not enforced.
+// 0x + 40 hex. A mixed-case address must carry its EIP-55 checksum.
 function validateEvmRefundAddress(addr: string): boolean {
-  return /^0x[a-fA-F0-9]{40}$/.test(addr.trim());
+  const trimmed = addr.trim();
+  if (!/^0x[a-fA-F0-9]{40}$/.test(trimmed)) return false;
+  const hex = trimmed.slice(2);
+  const lower = hex.toLowerCase();
+  return (
+    hex === lower || hex === hex.toUpperCase() || trimmed === checksumAddress(hexToBytes(lower))
+  );
 }
 
 function validateSolanaAddress(addr: string): boolean {
@@ -97,7 +105,8 @@ type UriBuilder = (
 export const EVM_CHAINS: Readonly<Record<string, { id: number; shortName: string }>> = {
   Ethereum: { id: 1, shortName: "eth" },
   Arbitrum: { id: 42161, shortName: "arb1" },
-};
+  Bsc: { id: 56, shortName: "bnb" },
+} satisfies Record<EvmChain, unknown>;
 
 /** The token contracts a payment URI names, on mainnet, as the Chainflip SDK lists them. */
 export const TOKEN_CONTRACTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
@@ -108,6 +117,9 @@ export const TOKEN_CONTRACTS: Readonly<Record<string, Readonly<Record<string, st
   Arbitrum: {
     USDC: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
     USDT: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+  },
+  Bsc: {
+    USDT: "0x55d398326f99059fF775485246999027B3197955",
   },
   Solana: {
     USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -139,8 +151,10 @@ const CHAIN_URI_BUILDERS: Record<string, UriBuilder> = {
     `bitcoin:${addr}?amount=${formatBaseUnits(amount, decimals)}`,
   Ethereum: (addr, asset, amount) =>
     evmUri(addr, asset, amount, EVM_CHAINS.Ethereum!.id, TOKEN_CONTRACTS.Ethereum!),
-  Arbitrum: (addr, asset, amount) =>
-    evmUri(addr, asset, amount, EVM_CHAINS.Arbitrum!.id, TOKEN_CONTRACTS.Arbitrum!),
+  // The other EVM chains get the bare address. Trust Wallet reads a code that names their chain
+  // id as a send of ETH on Ethereum, with the wrong amount.
+  Arbitrum: (addr) => addr,
+  Bsc: (addr) => addr,
   Solana: (addr, asset, amount, decimals) => {
     // Solana Pay names the recipient first on every asset; a token adds its mint.
     const base = `solana:${addr}?amount=${formatBaseUnits(amount, decimals)}`;
@@ -257,6 +271,17 @@ export const SOURCE_CONFIGS: readonly SourceConfig[] = Object.freeze([
     "Tether USD",
     6,
     "250000000",
+    validateEvmRefundAddress,
+  ),
+  makeSource("bnb-bsc", "Bsc", "BNB", "BNB", 18, "400000000000000000", validateEvmRefundAddress),
+  // USDT on BNB Chain has 18 decimals, where every other USDT here has 6.
+  makeSource(
+    "usdt-bsc",
+    "Bsc",
+    "USDT",
+    "Tether USD",
+    18,
+    "250000000000000000000",
     validateEvmRefundAddress,
   ),
   makeSource("sol-solana", "Solana", "SOL", "Solana", 9, "3000000000", validateSolanaAddress),

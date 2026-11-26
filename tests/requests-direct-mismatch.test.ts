@@ -5,7 +5,7 @@
 // there any balance is the deposit, since the provider delivers what was asked.
 
 import { describe, expect, it } from "vitest";
-import { DIRECT_SLIPPAGE_PCT } from "@getsome/funding";
+import { DIRECT_SLIPPAGE_PCT, withHeadroom } from "@getsome/funding";
 import { reduce } from "../app/funding/requests/reducer";
 import type {
   AcceptedDepositTerms,
@@ -113,6 +113,24 @@ describe("a Polkadot deposit", () => {
       keep + ((askedDot - keep) * 10_000n) / BigInt(Math.round((100 + DIRECT_SLIPPAGE_PCT) * 100));
     expect(reduce(native, reading(plain, 10, null)).status.kind).toBe("deposit-seen");
     expect(reduce(native, reading(plain - 1n, 10, null)).depositMismatch?.kind).toBe("short");
+
+    // What the ask carries for a burner the chain keeps open is not in the gate either: the
+    // worker converts at the quote plus the fee native.
+    const quoted = 29_500_000_000n;
+    const keepAlive = 118_000_000n;
+    const keptOpen = record("dot-assethub", {
+      asset: "DOT",
+      amount: withHeadroom(quoted, DIRECT_SLIPPAGE_PCT) + keep + keepAlive,
+      handoff: {
+        tier: "pool",
+        keepNativeForFees: keep.toString(),
+        keepAliveNative: keepAlive.toString(),
+      },
+    });
+    expect(reduce(keptOpen, reading(quoted + keep, 10, null)).status.kind).toBe("deposit-seen");
+    expect(reduce(keptOpen, reading(quoted + keep - 1n, 10, null)).depositMismatch?.kind).toBe(
+      "short",
+    );
   });
 
   it("records a balance in another direct token as a wrong-token deposit", () => {
@@ -163,6 +181,37 @@ describe("a Polkadot deposit", () => {
       expect(read.status.kind).toBe(ended.status.kind);
       expect(read.depositMismatch).toBeUndefined();
     }
+  });
+
+  it("expires once its deposit was lost, records what is sent since, and is brought back only by the deposit", () => {
+    const job = { done: false, lastTickAt: 30, claim: null } as const;
+    const seen = reduce(record("dotusd-assethub"), reading(ASKED, 10, null));
+    const taken = reduce(seen, {
+      source: "worker",
+      at: 20,
+      job: { ...job, phase: "swap", fundsSeenAt: 15 },
+    });
+    const lost = reduce(taken, {
+      source: "worker",
+      at: 30,
+      job: {
+        ...job,
+        phase: "failed",
+        failure: "deposit-lost",
+        fundsSeenAt: null,
+        depositLeftAt: 25,
+      },
+    });
+    expect(lost.status.kind).toBe("expired");
+
+    // Less than asked, or another token, sent after it expired: recorded, for the ending to offer
+    // back, and the request stays ended.
+    const short = reduce(lost, reading(8_000_000n, 40));
+    expect(short.status.kind).toBe("expired");
+    expect(short.depositMismatch).toMatchObject({ kind: "short", amount: "8000000" });
+    const other = reduce(lost, reading(0n, 40, { asset: "USDT", amount: "5" }));
+    expect(other.depositMismatch).toMatchObject({ kind: "token", asset: "USDT" });
+    expect(reduce(lost, reading(ASKED, 40)).status.kind).toBe("deposit-seen");
   });
 
   it("takes the accepted terms while still on the deposit, and drops the mismatch", () => {

@@ -61,11 +61,17 @@ vi.mock("@getsome/withdraw", async (importOriginal) => ({
   withdrawTickOnce: mocks.withdrawTickOnce,
 }));
 
-// How the CASH moves to Asset Hub is the chains' answer, and the scripted leg does not read it.
+// How the CASH moves to Asset Hub is the chains' answer, and the scripted leg does not read it;
+// so is what a key's balance converts to on its way home.
 vi.mock("@getsome/funding", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   chooseCashTransfer: async () => "teleport",
   chooseRoute: async () => ({ tier: "pool", external: "USDT" }),
+  quoteDepositValue: async () => ({
+    receive: 1_000_000n,
+    remoteFeeBuffer: 1_000n,
+    keepNativeForFees: 0n,
+  }),
 }));
 
 // The residue is read off the key on Asset Hub through a client the engine opens for it.
@@ -242,6 +248,7 @@ describe("a fiat sale through an offramp lane", () => {
     mocks.channel.mockResolvedValue({
       depositAddress: CF_DEPOSIT,
       destinationAddress: SOLANA_DEPOSIT,
+      refundAddress: "5Key",
       expired: false,
     });
     mocks.railFor.mockReturnValue({ status: mocks.status, channel: mocks.channel });
@@ -318,6 +325,7 @@ describe("a fiat sale through an offramp lane", () => {
     mocks.channel.mockResolvedValue({
       depositAddress: CF_DEPOSIT,
       destinationAddress: "Some0therSo1anaAddressThatIsNotTheProv1der",
+      refundAddress: "5Key",
       expired: false,
     });
     const engine = await landed();
@@ -358,6 +366,7 @@ describe("a fiat sale through an offramp lane", () => {
     mocks.channel.mockResolvedValue({
       depositAddress: CF_DEPOSIT,
       destinationAddress: SOLANA_DEPOSIT,
+      refundAddress: "5Key",
       expired: true, // Meld closed the order once the swap paid it
     });
     const resumed = await engineWith({ "s-1": job });

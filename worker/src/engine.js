@@ -33,8 +33,10 @@ import {
   anchorFor,
   asBig,
   bounded,
+  brief,
   connectChain,
   createJobStore,
+  errorText,
   fromHex,
   keypairFor,
   toHex,
@@ -62,6 +64,11 @@ const RUN_TIMEOUT_MS = 900_000;
 const MAX_TICK_GAP_MS = 30_000;
 /** A job whose deposit never arrives is retired after this, releasing the keep-alive. */
 const DEPOSIT_WINDOW_MS = 86_400_000;
+/** A deposit that left the best chain after it was seen is waited for this long from when it
+ *  left, then the job fails as lost. Long, since a provider's transfer can land again late, after
+ *  an outage. The page warns an hour after it left, and asks for a direct deposit again after ten
+ *  minutes. */
+const DEPOSIT_RETURN_WINDOW_MS = 86_400_000;
 
 const store = createJobStore(FUNDING_KEY, "funding");
 const loadJobs = () => store.load();
@@ -89,9 +96,12 @@ const saveJobs = () => store.save();
  *                                            // await-native: the route's deposit asset
  *                                            // recovering: the CASH is in People's trap and
  *                                            // the burner is claiming it back
- *   failure?: "shortfall" | "timeout" | "expired" | "cancelled" | "claim" | "held" | "trapped",
+ *   failure?: "shortfall" | "timeout" | "expired" | "cancelled" | "claim" | "held" | "trapped"
+ *     | "deposit-lost",
  *                                            // trapped: a way home's program left the CASH in
  *                                            // People's trap, which no one is asked to fund
+ *                                            // deposit-lost: the deposit left the best chain
+ *                                            // and did not come back within a day
  *                                            // held: the PSM refused the mint three times; the
  *                                            // deposit stays on the burner
  *   trap?: { amount: string, key, claimerHex, at },
@@ -130,7 +140,8 @@ const saveJobs = () => store.save();
  *                                            // done: the CASH is on People; taken back while
  *                                            // the conversion's block is discarded and resent
  *   state: { attempts, psmRefusals, xcmSubmitted, peopleAtXcm: string,
- *            fundsSeenAt: number|null, nonceAtSubmit: number|null,
+ *            fundsSeenAt: number|null, depositLeftAt: number|null, replacedAt: number|null,
+ *            emptyReadAt: number|null, heldReadAt: number|null, nonceAtSubmit: number|null,
  *            inclusionBlock: number|null, inclusionHash: string|null, arrived,
  *            sentToPeople: string|null, peopleFeeCash: string|null, workedMs,
  *            rejections, lastRejection },
@@ -146,8 +157,8 @@ const saveJobs = () => store.save();
  *                                            // conversion was seen in, while it is not final
  *                                            // arrived: the CASH was seen on People; done holds
  *                                            // on it while that block stands
- *                                            // workedMs: worker time since the deposit was
- *                                            // final, until the claim is registered (see
+ *                                            // workedMs: worker time since the pipeline took
+ *                                            // the deposit, until the claim is registered (see
  *                                            // accountWorkedTime)
  *                                            // rejections, lastRejection: paid rejections in
  *                                            // a row with the same answer
@@ -155,8 +166,8 @@ const saveJobs = () => store.save();
  *   txs: [{ call, txHash, block? }],
  *   depositSeen?: { block, finalizedAtSeen, finalized, best },
  *                                            // the deposit in a best block, followed until the
- *                                            // pipeline sees it final: block: the best block it
- *                                            // was first seen in; finalizedAtSeen: the finalized
+ *                                            // pipeline takes it: block: the best block it was
+ *                                            // first seen in; finalizedAtSeen: the finalized
  *                                            // block number then; finalized and best: at the
  *                                            // last tick
  *   conversion?: { preparedAt, converted?: { txHash, block, at, workedMs } },
@@ -297,7 +308,7 @@ export async function startFunding(params) {
   } catch (error) {
     // Refusals are returned as data; the surface receives them as WorkerCallError("invalid",
     // reason).
-    return { error: "invalid", reason: String(error?.message ?? error) };
+    return { error: "invalid", reason: errorText(error) };
   }
   const burner = await keypairFor(record.label);
   if (burner.address !== record.burnerAddress) {
@@ -374,7 +385,7 @@ function rearm(record, nowMs) {
 function fail(record, failure, reason) {
   record.phase = "failed";
   record.failure = failure;
-  record.lastError = reason;
+  record.lastError = brief(reason);
   unwatchClaim(record.sessionId);
 }
 
@@ -444,7 +455,7 @@ export async function amendFunding(params) {
     // The same checks a new hand-off gets, route included.
     terms = newRecord({ ...input, label: record.label }, Date.now());
   } catch (error) {
-    return { error: "invalid", reason: String(error?.message ?? error) };
+    return { error: "invalid", reason: errorText(error) };
   }
   for (const field of ["tier", "external", "feeRate", "quotedDeposit"]) delete record[field];
   Object.assign(record, {
@@ -459,7 +470,7 @@ export async function amendFunding(params) {
   return describeFunding(record);
 }
 
-/** True while the funding leg waits for a deposit the pipeline has not yet seen final. */
+/** True while the funding leg waits for a deposit the pipeline has not yet taken. */
 const waitingForDeposit = (record) => !record.done && record.state.fundsSeenAt === null;
 
 /** True once the CASH has landed and been claimed; `done` alone means the funding leg is over. */
@@ -593,7 +604,7 @@ async function registerClaim(record, burner) {
       return;
     }
     if (!(error instanceof PaymentTopUpErr.AlreadyExists)) {
-      record.claim = { ...record.claim, error: String(error?.message ?? error) };
+      record.claim = { ...record.claim, error: errorText(error) };
       throw error;
     }
     // The host holds this attempt as it was first sized: that amount is the claim's.
@@ -634,7 +645,7 @@ function watchClaim(record) {
       if (error instanceof PaymentTopUpStatusErr.NotFound) {
         record.claim = { ...record.claim, phase: "registering", at: 0 };
       } else {
-        record.claim = { ...record.claim, error: String(error?.message ?? error) };
+        record.claim = { ...record.claim, error: errorText(error) };
         record.lastError = record.claim.error;
       }
       void saveJobs();
@@ -747,6 +758,7 @@ function describeFunding(record) {
     submitting: record.submitting,
     txs: record.txs,
     fundsSeenAt: record.state?.fundsSeenAt ?? null,
+    depositLeftAt: record.state?.depositLeftAt ?? null,
     depositSeen: record.depositSeen ?? null,
     conversion: record.conversion ?? null,
     claim: record.claim ?? null,
@@ -816,6 +828,16 @@ function judgeBounds(record, nowMs, read) {
     fail(record, "timeout", `the host has not settled the claim within ${CLAIM_TRACK_WINDOW_MS}ms`);
     return;
   }
+  // A deposit that arrived and then left the best chain did arrive within the window: it is
+  // waited for from when it left, however late that was in the window, or from a re-arm since.
+  const leftAt = record.state.depositLeftAt ?? null;
+  if (leftAt !== null) {
+    const waitingSince = Math.max(leftAt, record.armedAt ?? 0);
+    if (read && waitingForDeposit(record) && nowMs - waitingSince > DEPOSIT_RETURN_WINDOW_MS) {
+      fail(record, "deposit-lost", "the deposit left the best chain and did not come back");
+    }
+    return;
+  }
   // The rail's deadline when the surface passed one, the default window otherwise.
   const armedAt = record.armedAt ?? record.createdAt;
   const expiresAt = record.depositExpiresAt ?? armedAt + DEPOSIT_WINDOW_MS;
@@ -868,12 +890,32 @@ async function tickRecord(record, nowMs) {
   }
 }
 
+/**
+ * What a tick found the forks took, on the record the page reads. A discarded block takes the
+ * done and the conversion it held: the page shows the conversion again until it lands again. A
+ * deposit that left the best chain takes its sighting and the run's clock with it.
+ */
+function followForks(record, submittedBefore, leftBefore) {
+  if (submittedBefore && !record.state.xcmSubmitted) {
+    record.done = false;
+    if (record.conversion?.converted) {
+      const { converted: _taken, ...kept } = record.conversion;
+      record.conversion = kept;
+    }
+  }
+  if (leftBefore === null && (record.state.depositLeftAt ?? null) !== null) {
+    delete record.depositSeen;
+    record.state.workedMs = 0;
+  }
+}
+
 /** The job's own conversion: the deposit the surface quoted, through the route it recorded. */
 async function convert(record, env) {
   // The tier is an input to this worker, never a decision it makes: a job converts through the
   // route it was quoted or not at all.
   const route = recordedRoute(record);
   const submittedBefore = !!record.state.xcmSubmitted;
+  const leftBefore = record.state.depositLeftAt ?? null;
   let outcome;
   try {
     outcome = await runConversion(record, env, {
@@ -894,11 +936,12 @@ async function convert(record, env) {
       onConversion: (fact) => recordConversion(record, fact),
     });
   } catch (error) {
-    // The tick found the block discarded and failed after that: the done goes with the block
-    // here as it would have at the end of the tick.
-    if (submittedBefore && !record.state.xcmSubmitted) record.done = false;
+    // The tick found a fork and failed after that: what the fork took goes here as it would
+    // have at the end of the tick.
+    followForks(record, submittedBefore, leftBefore);
     throw error;
   }
+  followForks(record, submittedBefore, leftBefore);
   // A cancel that landed during this tick stands.
   if (record.phase === "failed") return;
   record.phase = outcome.step;
@@ -931,6 +974,10 @@ function restoreTickState(stored) {
   state.xcmSubmitted = !!stored.xcmSubmitted;
   state.peopleAtXcm = asBig(stored.peopleAtXcm);
   state.fundsSeenAt = stored.fundsSeenAt ?? null;
+  state.depositLeftAt = stored.depositLeftAt ?? null;
+  state.replacedAt = stored.replacedAt ?? null;
+  state.emptyReadAt = stored.emptyReadAt ?? null;
+  state.heldReadAt = stored.heldReadAt ?? null;
   state.nonceAtSubmit = stored.nonceAtSubmit ?? null;
   state.inclusionBlock = stored.inclusionBlock ?? null;
   state.inclusionHash = stored.inclusionHash ?? null;
@@ -949,6 +996,10 @@ function storeTickState(state) {
     xcmSubmitted: state.xcmSubmitted,
     peopleAtXcm: state.peopleAtXcm.toString(),
     fundsSeenAt: state.fundsSeenAt,
+    depositLeftAt: state.depositLeftAt,
+    replacedAt: state.replacedAt,
+    emptyReadAt: state.emptyReadAt,
+    heldReadAt: state.heldReadAt,
     nonceAtSubmit: state.nonceAtSubmit,
     inclusionBlock: state.inclusionBlock,
     inclusionHash: state.inclusionHash,
@@ -1054,9 +1105,9 @@ async function runConversion(record, env, job) {
 }
 
 /**
- * Follows the deposit while the pipeline waits for it to be final: it reads the burner at the
- * anchor until the deposit shows there, then only moves the finalized block number on. The
- * pipeline decides on the finalized deposit alone.
+ * Follows the deposit while the pipeline waits for it: it reads the burner at the anchor until
+ * the deposit shows there, then only moves the block numbers on. The pipeline decides on its own
+ * best block read.
  */
 async function followDeposit(record, api, route, address, anchor) {
   if (record.depositSeen) {
@@ -1292,7 +1343,7 @@ async function fundRecovery(record, env, feeCash) {
       delete recovery.depositGate;
       delete recovery.depositHeld;
     }
-    throw new Error(`recovery deposit: ${String(error?.message ?? error)}`);
+    throw new Error(`recovery deposit: ${errorText(error)}`);
   }
   recovery.deposit = outcome.step;
   if (outcome.step === "done") {
@@ -1418,7 +1469,7 @@ export async function tickAllFunding() {
         if (error instanceof FundingShortfallError && conversionPending(record)) {
           // The verdict is on a block the chain can still discard: it stands only once the
           // block is final, and a discarded block sends the conversion again instead.
-          record.lastError = `shortfall: ${error.message}`;
+          record.lastError = brief(`shortfall: ${error.message}`);
         } else if (error instanceof FundingShortfallError) {
           fail(record, "shortfall", `shortfall: ${error.message}`);
         } else if (error instanceof FundingTrappedError) {
@@ -1438,7 +1489,7 @@ export async function tickAllFunding() {
           fail(record, "held", error.message);
         } else {
           // Other errors are transient; the next wake retries.
-          record.lastError = String(error?.message ?? error);
+          record.lastError = errorText(error);
         }
       }
       judgeBounds(record, nowMs, read);

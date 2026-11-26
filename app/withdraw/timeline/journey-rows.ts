@@ -4,13 +4,17 @@
 
 import { formatSourceAmount, SOURCE_CONFIG_BY_ID } from "@getsome/chainflip";
 import { depositTokenOf, recordedRoute } from "@getsome/funding";
-import { sourceIdFor } from "~~/lib/config";
 import type { DetailRow } from "../../components/ui/DetailRows.vue";
-import { isWithdrawalSideExit, type WithdrawalRecord } from "../../funding/requests/model";
+import {
+  isWithdrawalSideExit,
+  WITHDRAW_SOURCE_PREFIX,
+  type WithdrawalRecord,
+} from "../../funding/requests/model";
 import { asName } from "../../funding/top-up-projection";
 import { shortRef } from "../../utils/journey";
 import { fmtFiat } from "../../utils/money";
 import { formatLanding, shortDestinationAddress } from "../destinations";
+import { chainLabel } from "~~/lib/config";
 
 export interface JourneyRowsContext {
   /** The route still holds the quote behind the receive row, so the row opens its fees. */
@@ -22,12 +26,11 @@ export interface JourneyRowsContext {
 export function expectedEgressText(record: WithdrawalRecord): string | null {
   const egress = record.handoff.channel?.expectedEgress;
   if (egress === undefined) return null;
-  const { chain, asset } = record.destination;
-  const id = sourceIdFor(chain, asset);
-  const config = id === undefined ? undefined : SOURCE_CONFIG_BY_ID.get(id);
+  const id = record.ref.sourceId?.slice(WITHDRAW_SOURCE_PREFIX.length);
+  const config = SOURCE_CONFIG_BY_ID.get(id as never);
   if (config === undefined) return null;
   try {
-    return `≈ ${formatSourceAmount(config, egress, { maxDecimals: 6 })} ${asset}`;
+    return `≈ ${formatSourceAmount(config, egress, { maxDecimals: 6 })} ${record.destination.asset}`;
   } catch {
     return null;
   }
@@ -70,7 +73,7 @@ function cryptoRows(record: WithdrawalRecord, { feesAvailable }: JourneyRowsCont
   if (egress !== null) rows.push({ label: "You'll receive", value: egress, fees: feesAvailable });
   rows.push({
     label: "To this address",
-    sublabel: `on ${record.destination.chain} Network`,
+    sublabel: `on ${chainLabel(record.destination.chain)} Network`,
     value: shortDestinationAddress(record.destination.address),
     title: record.destination.address,
   });
